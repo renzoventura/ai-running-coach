@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: AI Running Coach - Lambda + Strands Agent
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 512
+    Runtime: python3.12
+    Environment:
+      Variables:
+        MODEL_ID: "anthropic.claude-haiku-3-5-20241022-v2:0"
+
+Resources:
+  RunningCoachFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ai-running-coach
+      Handler: src/handler.lambda_handler
+      CodeUri: .
+      Description: AI running coach powered by Strands agent framework
+      Policies:
+        - AmazonBedrockFullAccess
+      Events:
+        ApiPost:
+          Type: Api
+          Properties:
+            Path: /coach
+            Method: post
+            RestApiId: !Ref RunningCoachApi
+
+  RunningCoachApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'POST,OPTIONS'"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${RunningCoachApi}.execute-api.${AWS::Region}.amazonaws.com/prod/coach"
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt RunningCoachFunction.Arn
