@@ -5,7 +5,7 @@
 - FastAPI for routing and auto-generated API docs
 - Mangum as the Lambda adapter for FastAPI
 - Strands agent framework for orchestration
-- Amazon Bedrock Claude Haiku 3 for LLM calls
+- Amazon Bedrock Claude Haiku 4.5 (`au.anthropic.claude-haiku-4-5-20251001-v1:0`) for LLM calls
 - DynamoDB for storing user profiles, Garmin credentials (encrypted), chat history
 - garmin-connect library for Garmin data
 - AWS region: ap-southeast-2 (Sydney)

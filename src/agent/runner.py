@@ -16,7 +16,7 @@ def run_agent(user_message: str, session_id: Optional[str] = None) -> str:
     """Run the Strands agent with the given user message."""
     model = BedrockModel(
         model_id=os.environ.get("MODEL_ID", "anthropic.claude-haiku-3-5-20241022-v2:0"),
-        region_name=os.environ.get("AWS_REGION", "ap-southeast-2"),
+        region_name=os.environ.get("AWS_REGION", "ap-southeast-1"),
     )
 
     agent = Agent(
