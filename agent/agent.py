@@ -18,9 +18,18 @@ SYSTEM_PROMPT = """You are a running coach. Talk like a real coach would — dir
 
 Keep responses short. Use markdown freely — bold key stats, bullet points for lists, headers if breaking down a topic. But don't overdo it, keep it conversational.
 
-You have access to their Garmin data — use it to give advice that's actually relevant to them. Don't explain what the data means in detail, just use it to inform what you say.
+STRICT DATA RULES — follow these without exception:
+- Always call the relevant tools before answering anything about training, runs, sleep, or health.
+- Only report numbers and activities that are explicitly present in the tool response. If a field is not in the data, do not mention it.
+- Never estimate, infer, approximate, or invent any stat — not distance, pace, HR, load, activity type, or anything else.
+- If the tool returns no data or incomplete data, say exactly that. Do not fill the gap.
+- If you are not certain a value came from the tool response, do not say it.
 
-If they ask how training is going, give them a quick honest read. If they ask what to do next, tell them. Be straight with them."""
+When asked about a workout or training period:
+1. Show the exact data you retrieved — only what the tool actually returned.
+2. Give your coaching take based solely on what you just showed.
+
+If you catch yourself about to say something you didn't see in the tool output, stop and don't say it."""
 
 
 def run_agent(
@@ -71,8 +80,29 @@ def _build_prompt(
         local_tz = ZoneInfo(timezone)
     except Exception:
         local_tz = ZoneInfo("Australia/Melbourne")
-    today_local = datetime.now(local_tz).strftime("%A, %d %B %Y")
-    context = f"Today is {today_local} ({timezone} time). Garmin activity timestamps are in UTC — keep this in mind when the user refers to days of the week.\n\n"
+    now_local = datetime.now(local_tz)
+    today_local = now_local.strftime("%A, %d %B %Y")
+
+    # Pre-compute the UTC date(s) each local day of this week maps to.
+    # A local day can span two UTC dates (e.g. Melbourne UTC+11 means midnight local = 1pm previous day UTC).
+    monday = now_local.date() - timedelta(days=now_local.weekday())
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_map_lines = []
+    utc_tz = ZoneInfo("UTC")
+    for i, day_name in enumerate(day_names):
+        local_date = monday + timedelta(days=i)
+        start_utc = datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0, tzinfo=local_tz).astimezone(utc_tz).date()
+        end_utc = datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59, tzinfo=local_tz).astimezone(utc_tz).date()
+        utc_dates = sorted({str(start_utc), str(end_utc)})
+        day_map_lines.append(f"  {day_name} {local_date} → UTC {' and '.join(utc_dates)}")
+
+    day_map = "\n".join(day_map_lines)
+    context = (
+        f"Today is {today_local} ({timezone}).\n"
+        f"This week's local days mapped to their UTC equivalents in Garmin:\n{day_map}\n"
+        f"When the user refers to a day, use the UTC dates from the table above to find their activities. "
+        f"Do not calculate timezone offsets yourself — use this table.\n\n"
+    )
     if chat_history:
         history_text = "\n".join(
             f"{entry['role'].capitalize()}: {entry['message']}"

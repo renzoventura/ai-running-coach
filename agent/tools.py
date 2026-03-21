@@ -9,6 +9,166 @@ from services.garmin import GarminClient
 logger = logging.getLogger(__name__)
 
 
+def _fmt_pace(speed_mps: float | None) -> str | None:
+    """Convert speed in m/s to pace string 'M:SS' per km. Returns None if invalid."""
+    if not speed_mps or speed_mps <= 0:
+        return None
+    seconds_per_km = 1000 / speed_mps
+    minutes = int(seconds_per_km // 60)
+    seconds = int(seconds_per_km % 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _trim_activity(raw: dict) -> dict:
+    """Trim a raw Garmin activity dict to only the fields the agent needs."""
+    result = {}
+
+    date_val = raw.get("startTimeLocal") or raw.get("startTimeGMT")
+    if date_val:
+        result["date"] = str(date_val)[:10]
+
+    activity_type = raw.get("activityType", {})
+    if isinstance(activity_type, dict):
+        result["type"] = activity_type.get("typeKey") or activity_type.get("typeId")
+    elif activity_type:
+        result["type"] = str(activity_type)
+
+    distance = raw.get("distance")
+    if distance is not None:
+        result["distance_km"] = round(float(distance) / 1000, 1)
+
+    pace = _fmt_pace(raw.get("averageSpeed"))
+    if pace:
+        result["avg_pace_per_km"] = pace
+
+    avg_hr = raw.get("averageHR")
+    if avg_hr is not None:
+        result["avg_hr"] = int(avg_hr)
+
+    max_hr = raw.get("maxHR")
+    if max_hr is not None:
+        result["max_hr"] = int(max_hr)
+
+    duration = raw.get("elapsedDuration") or raw.get("duration")
+    if duration is not None:
+        result["elapsed_time_min"] = int(float(duration) / 60)
+
+    elevation = raw.get("elevationGain")
+    if elevation is not None:
+        result["elevation_gain_m"] = int(elevation)
+
+    raw_laps = raw.get("lapDTOs") or raw.get("laps") or []
+    if raw_laps:
+        laps = []
+        for i, lap in enumerate(raw_laps):
+            lap_dict = {"lap": i + 1}
+
+            distance = lap.get("distance")
+            if distance is not None:
+                lap_dict["distance_km"] = round(float(distance) / 1000, 2)
+
+            lap_pace = _fmt_pace(lap.get("averageSpeed"))
+            if lap_pace:
+                lap_dict["pace_per_km"] = lap_pace
+
+            lap_hr = lap.get("averageHR")
+            if lap_hr is not None:
+                lap_dict["avg_hr"] = int(lap_hr)
+
+            intensity = lap.get("intensity") or lap.get("lapTrigger")
+            if intensity:
+                lap_dict["type"] = str(intensity).lower()
+
+            if len(lap_dict) > 1:
+                laps.append(lap_dict)
+        if laps:
+            result["laps"] = laps
+
+    return result
+
+
+def _trim_sleep(raw: dict) -> dict:
+    """Trim a raw Garmin sleep record to only the fields the agent needs."""
+    result = {}
+
+    dto = raw.get("dailySleepDTO") or raw
+    date_val = dto.get("calendarDate") or dto.get("sleepStartTimestampLocal")
+    if date_val:
+        result["date"] = str(date_val)[:10]
+
+    total = dto.get("sleepTimeSeconds")
+    if total is not None:
+        result["total_sleep_hours"] = round(float(total) / 3600, 1)
+
+    deep = dto.get("deepSleepSeconds")
+    if deep is not None:
+        result["deep_sleep_hours"] = round(float(deep) / 3600, 1)
+
+    rem = dto.get("remSleepSeconds")
+    if rem is not None:
+        result["rem_sleep_hours"] = round(float(rem) / 3600, 1)
+
+    score = dto.get("sleepScores", {})
+    if isinstance(score, dict):
+        overall = score.get("overall", {})
+        if isinstance(overall, dict):
+            val = overall.get("value")
+        else:
+            val = overall
+        if val is not None:
+            result["sleep_score"] = int(val)
+    elif raw.get("sleepScore") is not None:
+        result["sleep_score"] = int(raw.get("sleepScore"))
+
+    return result
+
+
+def _trim_training_load(raw: dict) -> dict:
+    """Trim raw Garmin training load/status data to only the fields the agent needs."""
+    result = {}
+
+    status = raw.get("trainingStatus") or raw.get("latestTrainingStatus")
+    if status:
+        result["training_status"] = str(status)
+
+    aerobic = raw.get("aerobicTrainingEffect") or raw.get("acuteLoad")
+    if aerobic is not None:
+        result["aerobic_load"] = round(float(aerobic), 1)
+
+    anaerobic = raw.get("anaerobicTrainingEffect") or raw.get("chronicLoad")
+    if anaerobic is not None:
+        result["anaerobic_load"] = round(float(anaerobic), 1)
+
+    recovery = raw.get("recoveryTime") or raw.get("recoveryTimeSeconds")
+    if recovery is not None:
+        result["recovery_time_hours"] = int(float(recovery) / 3600) if float(recovery) > 24 else int(recovery)
+
+    return result
+
+
+def _trim_hr_day(raw: dict) -> dict:
+    """Trim a single day's HR record."""
+    result = {}
+
+    date_val = raw.get("date")
+    if date_val:
+        result["date"] = str(date_val)[:10]
+
+    rhr = raw.get("restingHR")
+    if rhr is not None:
+        result["resting_hr"] = int(rhr)
+
+    max_hr = raw.get("maxHR") or raw.get("maxHeartRate")
+    if max_hr is not None:
+        result["max_hr_today"] = int(max_hr)
+
+    hrv = raw.get("hrvStatus") or raw.get("hrv_status")
+    if hrv:
+        result["hrv_status"] = str(hrv)
+
+    return result
+
+
 def make_tools(garmin_client: GarminClient) -> list:
     """
     Create Strands-compatible tool functions bound to a connected GarminClient.
@@ -23,14 +183,49 @@ def make_tools(garmin_client: GarminClient) -> list:
     @tool
     def get_recent_activities() -> list[dict[str, Any]]:
         """
-        Retrieve the user's running activities from the last 28 days.
+        Retrieve the user's running activities from the last 28 days, including lap splits.
 
         Use this tool when the user asks about their recent runs, training history,
-        pace, distance, or workout performance. Returns a list of activity records
-        including date, distance, duration, average pace, and heart rate.
+        pace, distance, workout performance, or interval/lap splits. Returns a list
+        of trimmed activity records including date, type, distance, pace, heart rate,
+        and per-lap splits for activities in the last 14 days.
         """
         try:
-            return garmin_client.get_recent_activities(days=28)
+            from datetime import date, timedelta
+            raw = garmin_client.get_recent_activities(days=28)
+
+            cutoff = (date.today() - timedelta(days=14)).isoformat()
+            trimmed = []
+            for activity in raw:
+                if not activity:
+                    continue
+
+                # Fetch lap splits for recent running activities only
+                activity_type = activity.get("activityType", {})
+                type_key = activity_type.get("typeKey", "") if isinstance(activity_type, dict) else ""
+                is_running = "running" in str(type_key).lower()
+
+                date_val = str(activity.get("startTimeLocal") or activity.get("startTimeGMT") or "")[:10]
+                is_recent = date_val >= cutoff
+
+                if is_running and is_recent:
+                    activity_id = activity.get("activityId")
+                    if activity_id:
+                        splits = garmin_client.get_activity_splits(activity_id)
+                        lap_dtos = splits.get("lapDTOs") or splits.get("laps") or []
+                        logger.debug(
+                            "Activity %s raw lap fields: %s",
+                            activity_id,
+                            [list(lap.keys()) for lap in lap_dtos[:2]] if lap_dtos else "none",
+                        )
+                        if lap_dtos:
+                            activity = {**activity, "lapDTOs": lap_dtos}
+
+                trimmed.append(_trim_activity(activity))
+
+            trimmed = [a for a in trimmed if a]
+            logger.info("get_recent_activities returning %d trimmed records", len(trimmed))
+            return trimmed
         except Exception as e:
             logger.error("Failed to get recent activities: %s", e)
             return []
@@ -41,11 +236,15 @@ def make_tools(garmin_client: GarminClient) -> list:
         Retrieve the user's sleep data for the last 7 nights.
 
         Use this tool when the user asks about their sleep, recovery, or fatigue.
-        Returns nightly records including total sleep duration, sleep stages
-        (light, deep, REM), and Garmin sleep score.
+        Returns nightly records including total sleep, deep sleep, REM sleep hours,
+        and Garmin sleep score.
         """
         try:
-            return garmin_client.get_sleep_data(days=7)
+            raw = garmin_client.get_sleep_data(days=7)
+            trimmed = [_trim_sleep(s) for s in raw if s]
+            trimmed = [s for s in trimmed if s]
+            logger.info("get_sleep_data returning %d trimmed records", len(trimmed))
+            return trimmed
         except Exception as e:
             logger.error("Failed to get sleep data: %s", e)
             return []
@@ -56,28 +255,36 @@ def make_tools(garmin_client: GarminClient) -> list:
         Retrieve the user's training load and recovery metrics for the last 28 days.
 
         Use this tool when the user asks about their training load, whether they are
-        overtraining, or how their body is adapting to training. Returns metrics
-        including acute load, chronic load, load ratio, and recovery status.
+        overtraining, or how their body is adapting to training. Returns training
+        status, aerobic load, anaerobic load, and recovery time.
         """
         try:
-            return garmin_client.get_training_load(days=28)
+            raw = garmin_client.get_training_load(days=28)
+            trimmed = _trim_training_load(raw)
+            logger.info("get_training_load returning trimmed record: %s", list(trimmed.keys()))
+            return trimmed
         except Exception as e:
             logger.error("Failed to get training load: %s", e)
             return {}
 
     @tool
-    def get_heart_rate() -> dict[str, Any]:
+    def get_heart_rate() -> list[dict[str, Any]]:
         """
         Retrieve the user's resting heart rate and HR trends for the last 7 days.
 
         Use this tool when the user asks about their heart rate, cardiovascular
-        fitness, or signs of fatigue or illness. Returns resting HR, 7-day average,
-        and daily resting HR values.
+        fitness, or signs of fatigue or illness. Returns per-day records with
+        resting HR, max HR, and HRV status.
         """
         try:
-            return garmin_client.get_heart_rate(days=7)
+            raw = garmin_client.get_heart_rate(days=7)
+            daily = raw.get("dailyValues", [])
+            trimmed = [_trim_hr_day(d) for d in daily if d]
+            trimmed = [d for d in trimmed if d]
+            logger.info("get_heart_rate returning %d trimmed records", len(trimmed))
+            return trimmed
         except Exception as e:
             logger.error("Failed to get heart rate data: %s", e)
-            return {}
+            return []
 
     return [get_recent_activities, get_sleep_data, get_training_load, get_heart_rate]

@@ -95,6 +95,27 @@ class GarminClient:
         logger.info("Fetched sleep data for %d days", len(results))
         return results
 
+    def get_activity_splits(self, activity_id: str) -> dict:
+        """
+        Fetch lap/split data for a single activity by ID.
+
+        Args:
+            activity_id: Garmin activity ID (from the activityId field).
+
+        Returns:
+            Dict containing lapDTOs list, or empty dict on failure.
+        """
+        if not self._is_connected():
+            logger.warning("get_activity_splits called before connect()")
+            return {}
+        try:
+            splits = self._client.get_activity_splits(str(activity_id))
+            logger.info("Fetched splits for activity %s", activity_id)
+            return splits if splits else {}
+        except Exception as e:
+            logger.error("Failed to fetch splits for activity %s: %s", activity_id, e)
+            return {}
+
     def get_training_load(self, days: int = 28) -> dict:
         """
         Fetch training load and recovery metrics for the last N days.
