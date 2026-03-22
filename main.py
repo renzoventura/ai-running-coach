@@ -5,7 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from mangum import Mangum
 
-from routers import chat, onboard, health, training_plan
+from routers import chat, onboard, health, training_plan, user
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +39,7 @@ app.include_router(chat.router)
 app.include_router(onboard.router)
 app.include_router(health.router)
 app.include_router(training_plan.router)
+app.include_router(user.router)
 
 # Mangum adapter — used as the Lambda handler in handler.py
 handler = Mangum(app, lifespan="off")

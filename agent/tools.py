@@ -1,12 +1,32 @@
 """Strands agent tools for retrieving Garmin data."""
 import logging
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from strands import tool
 
 from services.garmin import GarminClient
 
 logger = logging.getLogger(__name__)
+
+
+def _to_local_date(timestamp: str, local_tz: ZoneInfo) -> str | None:
+    """
+    Convert a Garmin timestamp string to a local date string (YYYY-MM-DD).
+
+    Garmin returns startTimeGMT as UTC and startTimeLocal as the device's local time
+    (which may not match the user's current timezone). We convert GMT to the user's
+    actual local timezone deterministically — no LLM involvement.
+    """
+    if not timestamp:
+        return None
+    try:
+        # Garmin format: "2026-03-17 08:23:45" (no timezone info)
+        dt_utc = datetime.strptime(str(timestamp)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+        return dt_utc.astimezone(local_tz).strftime("%Y-%m-%d")
+    except Exception:
+        return str(timestamp)[:10]
 
 
 def _fmt_pace(speed_mps: float | None) -> str | None:
@@ -19,13 +39,18 @@ def _fmt_pace(speed_mps: float | None) -> str | None:
     return f"{minutes}:{seconds:02d}"
 
 
-def _trim_activity(raw: dict) -> dict:
+def _trim_activity(raw: dict, local_tz: ZoneInfo | None = None) -> dict:
     """Trim a raw Garmin activity dict to only the fields the agent needs."""
     result = {}
 
-    date_val = raw.get("startTimeLocal") or raw.get("startTimeGMT")
-    if date_val:
-        result["date"] = str(date_val)[:10]
+    # Always convert from GMT to user's local timezone deterministically
+    gmt = raw.get("startTimeGMT")
+    if gmt and local_tz:
+        result["date"] = _to_local_date(gmt, local_tz)
+    else:
+        date_val = raw.get("startTimeLocal") or gmt
+        if date_val:
+            result["date"] = str(date_val)[:10]
 
     activity_type = raw.get("activityType", {})
     if isinstance(activity_type, dict):
@@ -169,16 +194,22 @@ def _trim_hr_day(raw: dict) -> dict:
     return result
 
 
-def make_tools(garmin_client: GarminClient) -> list:
+def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne") -> list:
     """
     Create Strands-compatible tool functions bound to a connected GarminClient.
 
     Args:
         garmin_client: An authenticated GarminClient instance.
+        timezone: IANA timezone string for the user. Used to convert Garmin UTC
+                  timestamps to local dates deterministically before the agent sees them.
 
     Returns:
         List of tool functions ready to pass to a Strands Agent.
     """
+    try:
+        local_tz = ZoneInfo(timezone)
+    except Exception:
+        local_tz = ZoneInfo("Australia/Melbourne")
 
     @tool
     def get_recent_activities() -> list[dict[str, Any]]:
@@ -205,8 +236,10 @@ def make_tools(garmin_client: GarminClient) -> list:
                 type_key = activity_type.get("typeKey", "") if isinstance(activity_type, dict) else ""
                 is_running = "running" in str(type_key).lower()
 
-                date_val = str(activity.get("startTimeLocal") or activity.get("startTimeGMT") or "")[:10]
-                is_recent = date_val >= cutoff
+                # Use deterministic local date conversion for cutoff check
+                gmt = activity.get("startTimeGMT")
+                local_date = _to_local_date(gmt, local_tz) if gmt else str(activity.get("startTimeLocal", ""))[:10]
+                is_recent = (local_date or "") >= cutoff
 
                 if is_running and is_recent:
                     activity_id = activity.get("activityId")
@@ -221,7 +254,7 @@ def make_tools(garmin_client: GarminClient) -> list:
                         if lap_dtos:
                             activity = {**activity, "lapDTOs": lap_dtos}
 
-                trimmed.append(_trim_activity(activity))
+                trimmed.append(_trim_activity(activity, local_tz))
 
             trimmed = [a for a in trimmed if a]
             logger.info("get_recent_activities returning %d trimmed records", len(trimmed))

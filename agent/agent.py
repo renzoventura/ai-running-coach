@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from zoneinfo import ZoneInfo
 
 from strands import Agent
@@ -55,7 +55,7 @@ def run_agent(
     agent = Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=make_tools(garmin_client),
+        tools=make_tools(garmin_client, timezone),
     )
     prompt = _build_prompt(message, chat_history, timezone)
     logger.info("Running agent for user %s", user_id)
@@ -80,29 +80,12 @@ def _build_prompt(
         local_tz = ZoneInfo(timezone)
     except Exception:
         local_tz = ZoneInfo("Australia/Melbourne")
-    now_local = datetime.now(local_tz)
-    today_local = now_local.strftime("%A, %d %B %Y")
+    today_local = datetime.now(local_tz).strftime("%A, %d %B %Y")
 
-    # Pre-compute the UTC date(s) each local day of this week maps to.
-    # A local day can span two UTC dates (e.g. Melbourne UTC+11 means midnight local = 1pm previous day UTC).
-    monday = now_local.date() - timedelta(days=now_local.weekday())
-    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    day_map_lines = []
-    utc_tz = ZoneInfo("UTC")
-    for i, day_name in enumerate(day_names):
-        local_date = monday + timedelta(days=i)
-        start_utc = datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0, tzinfo=local_tz).astimezone(utc_tz).date()
-        end_utc = datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59, tzinfo=local_tz).astimezone(utc_tz).date()
-        utc_dates = sorted({str(start_utc), str(end_utc)})
-        day_map_lines.append(f"  {day_name} {local_date} → UTC {' and '.join(utc_dates)}")
+    # Only tell the agent today's local date — all activity dates in the tool data
+    # are already converted to the user's local timezone before reaching the agent.
+    context = f"Today is {today_local}. All activity dates in the data are already in the user's local timezone.\n\n"
 
-    day_map = "\n".join(day_map_lines)
-    context = (
-        f"Today is {today_local} ({timezone}).\n"
-        f"This week's local days mapped to their UTC equivalents in Garmin:\n{day_map}\n"
-        f"When the user refers to a day, use the UTC dates from the table above to find their activities. "
-        f"Do not calculate timezone offsets yourself — use this table.\n\n"
-    )
     if chat_history:
         history_text = "\n".join(
             f"{entry['role'].capitalize()}: {entry['message']}"
@@ -133,7 +116,7 @@ async def stream_agent(
     agent = Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=make_tools(garmin_client),
+        tools=make_tools(garmin_client, timezone),
     )
     prompt = _build_prompt(message, chat_history, timezone)
     logger.info("Streaming agent for user %s", user_id)

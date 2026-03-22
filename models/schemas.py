@@ -30,6 +30,11 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class DeleteResponse(BaseModel):
+    success: bool
+    message: str
+
+
 class ChatMessage(BaseModel):
     role: str       # "user" or "assistant"
     message: str

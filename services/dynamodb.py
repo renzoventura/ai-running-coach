@@ -256,6 +256,75 @@ def get_plan_days(user_id: str) -> list[dict]:
         return []
 
 
+def _delete_items_with_prefix(user_id: str, sk_prefix: str) -> int:
+    """
+    Delete all DynamoDB items for a user whose SK starts with the given prefix.
+
+    Returns the number of items deleted.
+    """
+    table = _get_table()
+    deleted = 0
+    last_key = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("PK").eq(f"USER#{user_id}") & Key("SK").begins_with(sk_prefix),
+            "ProjectionExpression": "PK, SK",
+        }
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+        response = table.query(**kwargs)
+        items = response.get("Items", [])
+        with table.batch_writer() as batch:
+            for item in items:
+                batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+                deleted += 1
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+    return deleted
+
+
+def _delete_item(user_id: str, sk: str) -> None:
+    """Delete a single DynamoDB item by exact PK + SK."""
+    _get_table().delete_item(Key={"PK": f"USER#{user_id}", "SK": sk})
+
+
+def clear_chat_history(user_id: str) -> bool:
+    """
+    Delete all chat messages for a user.
+
+    Returns True if successful, False otherwise.
+    """
+    try:
+        count = _delete_items_with_prefix(user_id, "CHAT#")
+        logger.info("Cleared %d chat messages for user %s", count, user_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to clear chat history for user %s: %s", user_id, e)
+        return False
+
+
+def delete_user_data(user_id: str) -> bool:
+    """
+    Delete all DynamoDB data for a user — profile, credentials, chat history, and training plan.
+
+    Returns True if successful, False otherwise.
+    """
+    try:
+        _delete_item(user_id, "PROFILE")
+        _delete_item(user_id, "CREDENTIALS")
+        chat_count = _delete_items_with_prefix(user_id, "CHAT#")
+        plan_count = _delete_items_with_prefix(user_id, "PLAN#")
+        logger.info(
+            "Deleted all data for user %s — %d chat messages, %d plan days",
+            user_id, chat_count, plan_count,
+        )
+        return True
+    except Exception as e:
+        logger.error("Failed to delete data for user %s: %s", user_id, e)
+        return False
+
+
 def get_chat_history(user_id: str, limit: int = 20) -> list[dict]:
     """
     Retrieve the most recent chat messages for a user, sorted newest first.
