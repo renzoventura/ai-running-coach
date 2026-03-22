@@ -401,10 +401,19 @@ def save_activities(user_id: str, activities: list[dict]) -> bool:
                 if not date:
                     continue
                 activity_id = activity.get("activity_id", date)
+                # Strip laps and activity_id — laps contain nested floats that DynamoDB
+                # can't store natively, and activity_id is already encoded in the SK.
+                # Calendar display only needs the summary fields.
+                exclude = {"laps", "activity_id"}
+                item = {
+                    k: str(v) if isinstance(v, float) else v
+                    for k, v in activity.items()
+                    if k not in exclude
+                }
                 batch.put_item(Item={
                     "PK": f"USER#{user_id}",
                     "SK": f"ACTIVITY#{date}#{activity_id}",
-                    **{k: str(v) if isinstance(v, float) else v for k, v in activity.items()},
+                    **item,
                 })
         logger.info("Saved %d activities for user %s", len(activities), user_id)
         return True
