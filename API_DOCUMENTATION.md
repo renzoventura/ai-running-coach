@@ -336,15 +336,26 @@ GET /chat/history?user_id=user_2abc123def456&limit=50
 
 ### `POST /training-plan/generate`
 
-Manually triggers training plan generation for a user. Normally the initial plan is generated automatically when onboarding completes — use this endpoint to regenerate a plan on demand.
+Generates a complete multi-week training block for the user. Normally triggered automatically when onboarding completes — use this endpoint to regenerate a plan on demand.
+
+**Plan length by goal:**
+| Goal | Weeks |
+|---|---|
+| First 5K | 8 |
+| First 10K | 10 |
+| First half marathon | 12 |
+| First marathon | 18 |
+| Just run consistently | 8 |
+
+If the user has a target race date, the plan runs from next Monday to race day, capped at the goal's default. Plan always starts on a Monday.
 
 On each request the backend:
 
 1. Fetches the user's profile (goal, target race date, training days) from DynamoDB
 2. Fetches Garmin credentials, decrypts via KMS, and authenticates with Garmin Connect
-3. Runs the Strands agent (Claude Haiku 4.5) which uses Garmin tools to assess current fitness
+3. Runs the Strands agent (Claude Haiku 4.5) which checks recent Garmin data, then generates the full block structured as: base phase → build phase → peak phase → taper
 4. Saves one DynamoDB item per day (`SK: PLAN#YYYY-MM-DD`)
-5. Returns the generated week
+5. Returns all weeks
 
 #### Request Body
 
@@ -354,11 +365,13 @@ On each request the backend:
 
 #### Response Body — `200 OK`
 
+Same shape as `GET /training-plan` — all weeks grouped and sorted chronologically.
+
 | Field | Type | Description |
 |---|---|---|
-| `week` | `object` | The generated plan week |
-| `week.week_start` | `string` | ISO date of the Monday this week starts on |
-| `week.days` | `array` | Array of 7 `PlanDay` objects |
+| `weeks` | `array` | All generated `PlanWeek` objects sorted by `week_start` ascending |
+| `weeks[].week_start` | `string` | ISO date of the Monday this week starts on |
+| `weeks[].days` | `array` | Array of 7 `PlanDay` objects |
 
 **`PlanDay` object:**
 
@@ -368,7 +381,7 @@ On each request the backend:
 | `week_start` | `string` | ISO date of the Monday this day belongs to |
 | `type` | `string` | Workout type: `intervals`, `tempo`, `threshold`, `fartlek`, `easy`, `long`, or `rest` |
 | `distance` | `number` | Distance in kilometres (`0` for rest days) |
-| `description` | `string` | Detailed workout description |
+| `description` | `string` | Specific workout description |
 
 #### Error Responses
 
@@ -395,32 +408,39 @@ Content-Type: application/json
 
 ```json
 {
-  "week": {
-    "week_start": "2026-03-30",
-    "days": [
-      {
-        "date": "2026-03-30",
-        "week_start": "2026-03-30",
-        "type": "easy",
-        "distance": 8.0,
-        "description": "Easy aerobic run at conversational pace. Keep HR in zone 2."
-      },
-      {
-        "date": "2026-03-31",
-        "week_start": "2026-03-30",
-        "type": "intervals",
-        "distance": 10.0,
-        "description": "10 min WU, 6 × 1km @ 4:00/km with 90s rest, 10 min CD"
-      },
-      {
-        "date": "2026-04-01",
-        "week_start": "2026-03-30",
-        "type": "rest",
-        "distance": 0,
-        "description": "Rest day — focus on recovery, stretching, and hydration."
-      }
-    ]
-  }
+  "weeks": [
+    {
+      "week_start": "2026-03-30",
+      "days": [
+        {
+          "date": "2026-03-30",
+          "week_start": "2026-03-30",
+          "type": "easy",
+          "distance": 6.0,
+          "description": "Easy aerobic run at conversational pace. Keep HR in zone 2."
+        },
+        {
+          "date": "2026-03-31",
+          "week_start": "2026-03-30",
+          "type": "rest",
+          "distance": 0,
+          "description": "Rest day — recovery, stretching, hydration."
+        }
+      ]
+    },
+    {
+      "week_start": "2026-04-06",
+      "days": [
+        {
+          "date": "2026-04-06",
+          "week_start": "2026-04-06",
+          "type": "easy",
+          "distance": 7.0,
+          "description": "Easy run building on last week's base."
+        }
+      ]
+    }
+  ]
 }
 ```
 

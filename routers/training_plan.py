@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException
 from agent.agent import generate_plan
 from models.schemas import (
     GeneratePlanRequest,
-    GeneratePlanResponse,
     GetPlanResponse,
     PlanDay,
     PlanWeek,
@@ -46,13 +45,14 @@ def _auth_garmin(user_id: str) -> GarminClient:
     return garmin_client
 
 
-@router.post("/training-plan/generate", response_model=GeneratePlanResponse)
-def generate_training_plan(request: GeneratePlanRequest) -> GeneratePlanResponse:
+@router.post("/training-plan/generate", response_model=GetPlanResponse)
+def generate_training_plan(request: GeneratePlanRequest) -> GetPlanResponse:
     """
-    Generate a weekly training plan for the user.
+    Generate a complete multi-week training block for the user.
 
-    Fetches Garmin data, runs the Strands agent to produce a structured 7-day
-    plan as JSON, saves one DynamoDB item per day, and returns the generated week.
+    Calculates the plan length from the user's goal and race date, fetches Garmin
+    data, runs the Strands agent to produce the full block as JSON, saves one
+    DynamoDB item per day, and returns all weeks.
     """
     user_profile = get_user_profile(request.user_id)
     if not user_profile:
@@ -76,14 +76,14 @@ def generate_training_plan(request: GeneratePlanRequest) -> GeneratePlanResponse
         logger.exception("Unexpected error during plan generation for user %s", request.user_id)
         raise HTTPException(status_code=500, detail="Failed to generate training plan. Please try again.")
 
-    saved_days: list[PlanDay] = []
-    week_start = ""
+    grouped: dict[str, list[PlanDay]] = defaultdict(list)
     for day_dict in days_raw:
         save_plan_day(request.user_id, day_dict)
-        saved_days.append(PlanDay(**day_dict))
-        week_start = day_dict["week_start"]
+        grouped[day_dict["week_start"]].append(PlanDay(**day_dict))
 
-    return GeneratePlanResponse(week=PlanWeek(week_start=week_start, days=saved_days))
+    weeks = [PlanWeek(week_start=ws, days=days) for ws, days in sorted(grouped.items())]
+    logger.info("Generated %d-week plan (%d days) for user %s", len(weeks), len(days_raw), request.user_id)
+    return GetPlanResponse(weeks=weeks)
 
 
 @router.get("/training-plan", response_model=GetPlanResponse)

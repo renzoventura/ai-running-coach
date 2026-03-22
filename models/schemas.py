@@ -59,10 +59,6 @@ class GeneratePlanRequest(BaseModel):
     user_id: str
 
 
-class GeneratePlanResponse(BaseModel):
-    week: PlanWeek
-
-
 class GetPlanResponse(BaseModel):
     weeks: list[PlanWeek]
 

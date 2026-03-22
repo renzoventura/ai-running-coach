@@ -227,55 +227,96 @@ async def stream_agent(
 
 
 
-PLAN_SYSTEM_PROMPT = """You are an expert AI running coach generating a structured weekly training plan.
+PLAN_SYSTEM_PROMPT = """You are an expert running coach generating a complete multi-week training block.
 
 You have access to tools to retrieve the user's Garmin data (recent activities, sleep, training load, heart rate).
-Use this data to tailor the plan to the user's current fitness and recovery state.
+Use this data to assess their current fitness before generating the plan.
 
-You MUST respond with ONLY a JSON array of exactly 7 objects — one per day starting from the given Monday.
+You MUST respond with ONLY a flat JSON array — one object per day for the entire plan.
 No markdown, no explanation, no code fences. Just the raw JSON array.
 
 Each object must have these exact fields:
 - "date": ISO date string "YYYY-MM-DD"
-- "week_start": ISO date string of the Monday for this week "YYYY-MM-DD"
+- "week_start": ISO date string of the Monday that week starts on "YYYY-MM-DD"
 - "type": one of: intervals, tempo, threshold, fartlek, easy, long, rest
 - "distance": number in kilometres (0 for rest days)
-- "description": detailed workout description (e.g. "10 min WU, 6 × 1km @ 4:00/km with 90s rest, 10 min CD")
+- "description": specific workout description (e.g. "10 min WU, 6 × 1km @ 4:00/km with 90s rest, 10 min CD")
 
-Example:
-[
-  {"date": "2026-03-23", "week_start": "2026-03-23", "type": "easy", "distance": 8.0, "description": "Easy aerobic run at conversational pace"},
-  {"date": "2026-03-24", "week_start": "2026-03-23", "type": "rest", "distance": 0, "description": "Rest day — focus on recovery and mobility"},
-  ...
-]"""
+Plan structure guidelines (adapt based on goal and athlete fitness):
+- Base phase (first ~30% of weeks): easy mileage only, build aerobic base, no hard sessions
+- Build phase (middle ~40%): introduce tempo runs and intervals, progressive weekly mileage
+- Peak phase (next ~20%): highest mileage weeks, race-pace work, longest long run
+- Taper (final 1–2 weeks): cut volume by 30–40%, keep some intensity, arrive fresh at race day
+- For "Just run consistently": 8-week base building block, no taper needed
+
+Rest day placement: respect the user's days-per-week constraint exactly.
+Long runs always on Sunday. Hard sessions (intervals, tempo) never on consecutive days."""
+
+
+# Default plan lengths in weeks by goal
+_PLAN_WEEKS: dict[str, int] = {
+    "First 5K": 8,
+    "First 10K": 10,
+    "First half marathon": 12,
+    "First marathon": 18,
+    "Just run consistently": 8,
+}
+
+
+def _plan_start() -> date:
+    """Return the next Monday (always start plans on a Monday)."""
+    today = date.today()
+    days_until_monday = (7 - today.weekday()) % 7 or 7
+    return today + timedelta(days=days_until_monday)
+
+
+def _plan_weeks(goal: str, race_date_str: str | None) -> int:
+    """
+    Calculate how many weeks the plan should cover.
+
+    If a race date is provided, use the number of weeks from next Monday to the
+    race date, capped at the goal's default. Otherwise use the goal default.
+    """
+    default = _PLAN_WEEKS.get(goal, 8)
+    if not race_date_str or goal == "Just run consistently":
+        return default
+    try:
+        race_date = date.fromisoformat(race_date_str)
+        start = _plan_start()
+        weeks_to_race = max(1, (race_date - start).days // 7)
+        return min(weeks_to_race, default)
+    except (ValueError, TypeError):
+        return default
 
 
 def generate_plan(
     user_id: str,
     garmin_client: GarminClient,
     user_profile: dict,
-    week_start: date | None = None,
 ) -> list[dict]:
     """
-    Generate a structured weekly training plan using the Strands agent.
+    Generate a complete multi-week training block using the Strands agent.
+
+    Calculates the plan length from the user's goal and race date, then asks the
+    agent to produce a flat JSON array of one object per day for the full block.
 
     Args:
         user_id: The unique identifier for the user.
         garmin_client: An authenticated GarminClient instance.
-        user_profile: Dict with goalRace, targetTime, trainingDays from DynamoDB.
-        week_start: The Monday to start the plan week. Defaults to next Monday.
+        user_profile: Profile dict with goal, targetRaceDate, daysPerWeek, name.
 
     Returns:
-        List of 7 plan day dicts parsed from the agent's JSON response.
+        List of plan day dicts (n_weeks × 7 items) parsed from the agent's JSON.
 
     Raises:
         ValueError: If the agent response cannot be parsed as valid plan JSON.
     """
-    if week_start is None:
-        today = date.today()
-        # Roll forward to the next Monday (or today if already Monday)
-        days_until_monday = (7 - today.weekday()) % 7 or 7
-        week_start = today + timedelta(days=days_until_monday)
+    goal = user_profile.get("goal", "Just run consistently")
+    race_date_str = user_profile.get("targetRaceDate")
+    n_weeks = _plan_weeks(goal, race_date_str)
+    plan_start = _plan_start()
+    plan_end = plan_start + timedelta(weeks=n_weeks) - timedelta(days=1)
+    total_days = n_weeks * 7
 
     model = BedrockModel(
         model_id=os.environ.get("MODEL_ID", "au.anthropic.claude-haiku-4-5-20251001-v1:0"),
@@ -289,22 +330,26 @@ def generate_plan(
     )
 
     prompt = (
-        f"Generate a 7-day training plan starting Monday {week_start.isoformat()}.\n\n"
+        f"Generate a complete {n_weeks}-week training block ({total_days} days total).\n\n"
+        f"Plan dates: {plan_start.isoformat()} to {plan_end.isoformat()}\n"
+        f"The array must contain exactly {total_days} objects — every day from {plan_start.isoformat()} to {plan_end.isoformat()} inclusive.\n\n"
         f"User profile:\n"
-        f"- Name: {user_profile.get('name', 'unspecified')}\n"
-        f"- Goal: {user_profile.get('goal', 'unspecified')}\n"
-        f"- Target race date: {user_profile.get('targetRaceDate', 'none')}\n"
-        f"- Training days per week: {user_profile.get('daysPerWeek', 'unspecified')}\n\n"
-        f"Use the available tools to check the user's recent activities, sleep, training load, "
-        f"and heart rate before generating the plan. Tailor intensity and volume accordingly.\n\n"
-        f"Respond with ONLY the raw JSON array — no markdown, no explanation."
+        f"- Name: {user_profile.get('name', 'Athlete')}\n"
+        f"- Goal: {goal}\n"
+        f"- Target race date: {race_date_str or 'none'}\n"
+        f"- Training days per week: {user_profile.get('daysPerWeek', '4')}\n\n"
+        f"First, use the available tools to check the athlete's recent activities, sleep, "
+        f"training load, and heart rate. Use this to set the starting mileage appropriately.\n\n"
+        f"Then respond with ONLY the raw JSON array of {total_days} objects — no markdown, no explanation."
     )
 
-    logger.info("Generating training plan for user %s (week_start=%s)", user_id, week_start)
+    logger.info(
+        "Generating %d-week plan for user %s (%s, %d days)",
+        n_weeks, user_id, goal, total_days,
+    )
     result = agent(prompt)
     raw = re.sub(r"<thinking>.*?</thinking>\n?", "", str(result), flags=re.DOTALL).strip()
 
-    # Extract JSON array from the response (guard against any stray text)
     match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
     if not match:
         raise ValueError(f"Agent did not return a JSON array. Response: {raw[:500]}")
@@ -314,7 +359,9 @@ def generate_plan(
     except json.JSONDecodeError as e:
         raise ValueError(f"Failed to parse plan JSON: {e}. Response: {raw[:500]}")
 
-    if not isinstance(days, list) or len(days) != 7:
-        raise ValueError(f"Expected 7 plan days, got {len(days) if isinstance(days, list) else 'non-list'}")
+    if not isinstance(days, list) or len(days) != total_days:
+        raise ValueError(
+            f"Expected {total_days} plan days, got {len(days) if isinstance(days, list) else 'non-list'}"
+        )
 
     return days
