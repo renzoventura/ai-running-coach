@@ -36,7 +36,7 @@ def _auth_garmin(user_id: str) -> GarminClient:
             detail="Unable to retrieve Garmin credentials. Please try again.",
         )
     garmin_client = GarminClient()
-    if not garmin_client.connect(credentials["garminEmail"], plaintext_password):
+    if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
         logger.error("Garmin Connect authentication failed for user %s", user_id)
         raise HTTPException(
             status_code=503,

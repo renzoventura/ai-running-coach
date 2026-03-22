@@ -32,7 +32,7 @@ def _get_garmin_client(user_id: str) -> GarminClient:
         logger.error("Failed to decrypt credentials for user %s", user_id)
         raise HTTPException(status_code=503, detail="Unable to retrieve Garmin credentials. Please try again.")
     garmin_client = GarminClient()
-    if not garmin_client.connect(credentials["garminEmail"], plaintext_password):
+    if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
         logger.error("Garmin Connect authentication failed for user %s", user_id)
         raise HTTPException(status_code=503, detail="Unable to connect to Garmin. Please check your credentials and try again.")
     return garmin_client
@@ -150,7 +150,7 @@ def _generate_initial_plan(user_id: str, profile: dict) -> None:
             return
         plaintext_password = decrypt_password(credentials["garminPasswordEncrypted"])
         garmin_client = GarminClient()
-        if not garmin_client.connect(credentials["garminEmail"], plaintext_password):
+        if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
             logger.error("Cannot generate plan — Garmin auth failed for user %s", user_id)
             return
 

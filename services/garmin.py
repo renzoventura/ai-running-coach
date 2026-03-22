@@ -8,6 +8,10 @@ import garminconnect
 
 logger = logging.getLogger(__name__)
 
+# Module-level in-memory session cache — survives across requests in the same
+# process (uvicorn worker or warm Lambda instance). Keyed by user_id.
+_session_cache: dict[str, str] = {}
+
 
 class GarminClient:
     """Wrapper around the garminconnect library for fetching user fitness data."""
@@ -19,28 +23,84 @@ class GarminClient:
         """Return True if connect() has been successfully called."""
         return self._client is not None
 
-    def connect(self, email: str, password: str) -> bool:
+    def _try_restore(self, email: str, session_data: str) -> bool:
         """
-        Initialise and authenticate the Garmin Connect client.
+        Attempt to restore a garth session from serialised token data.
 
-        Must be called before any data method. Never logs credentials.
-
-        Args:
-            email: Garmin account email address.
-            password: Garmin account password (plaintext, decrypted by caller).
-
-        Returns:
-            True if authentication succeeded, False otherwise.
+        Garth will auto-refresh the access token using the refresh token if needed.
+        Returns True if session was restored, False if the data is invalid/expired.
         """
+        try:
+            client = garminconnect.Garmin(email, "")
+            client.garth.loads(session_data)
+            self._client = client
+            logger.info("Garmin session restored from cache")
+            return True
+        except Exception as e:
+            logger.warning("Failed to restore Garmin session from cache: %s", e)
+            return False
+
+    def _full_login(self, email: str, password: str) -> bool:
+        """Perform a full Garmin Connect login. Never logs credentials."""
         try:
             client = garminconnect.Garmin(email, password)
             client.login()
             self._client = client
-            logger.info("Garmin client connected successfully")
+            logger.info("Garmin full login successful")
             return True
         except Exception as e:
-            logger.error("Failed to connect to Garmin Connect: %s", e)
+            logger.error("Garmin full login failed: %s", e)
             return False
+
+    def connect(self, email: str, password: str, user_id: str | None = None) -> bool:
+        """
+        Authenticate with Garmin Connect, using a cached session where possible.
+
+        Resolution order:
+        1. In-memory cache (fastest — same process/warm Lambda)
+        2. DynamoDB session cache (persists across Lambda cold starts)
+        3. Full login with email + password (slowest — only when cache misses)
+
+        After a fresh login the session is saved to both caches for next time.
+
+        Args:
+            email: Garmin account email address.
+            password: Garmin account password (plaintext, decrypted by caller).
+            user_id: Clerk userId — used as cache key. If None, skips caching.
+
+        Returns:
+            True if authenticated successfully, False otherwise.
+        """
+        # 1. In-memory cache
+        if user_id and user_id in _session_cache:
+            if self._try_restore(email, _session_cache[user_id]):
+                return True
+            # Memory cache stale — evict and try DynamoDB
+            del _session_cache[user_id]
+
+        # 2. DynamoDB cache
+        if user_id:
+            from services.dynamodb import get_garmin_session
+            cached = get_garmin_session(user_id)
+            if cached and self._try_restore(email, cached):
+                _session_cache[user_id] = cached  # warm memory cache
+                return True
+
+        # 3. Full login
+        if not self._full_login(email, password):
+            return False
+
+        # Save fresh session to both caches
+        if user_id and self._client:
+            try:
+                session_data = self._client.garth.dumps()
+                _session_cache[user_id] = session_data
+                from services.dynamodb import save_garmin_session
+                save_garmin_session(user_id, session_data)
+            except Exception as e:
+                logger.warning("Failed to cache Garmin session for user %s: %s", user_id, e)
+
+        return True
 
     def get_recent_activities(self, days: int = 28) -> list:
         """

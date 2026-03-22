@@ -363,6 +363,7 @@ def delete_user_data(user_id: str) -> bool:
     try:
         _delete_item(user_id, "PROFILE")
         _delete_item(user_id, "CREDENTIALS")
+        _delete_item(user_id, "GARMIN_SESSION")
         chat_count = _delete_items_with_prefix(user_id, "CHAT#")
         plan_count = _delete_items_with_prefix(user_id, "PLAN#")
         activity_count = _delete_items_with_prefix(user_id, "ACTIVITY#")
@@ -374,6 +375,52 @@ def delete_user_data(user_id: str) -> bool:
     except Exception as e:
         logger.error("Failed to delete data for user %s: %s", user_id, e)
         return False
+
+
+def save_garmin_session(user_id: str, session_data: str) -> bool:
+    """
+    Persist a serialised garth session string to DynamoDB.
+
+    Args:
+        user_id: The unique identifier for the user.
+        session_data: Serialised garth OAuth2 token string from client.garth.dumps().
+
+    Returns:
+        True if saved successfully, False otherwise.
+    """
+    try:
+        table = _get_table()
+        table.put_item(Item={
+            "PK": f"USER#{user_id}",
+            "SK": "GARMIN_SESSION",
+            "sessionData": session_data,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info("Saved Garmin session for user %s", user_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to save Garmin session for user %s: %s", user_id, e)
+        return False
+
+
+def get_garmin_session(user_id: str) -> Optional[str]:
+    """
+    Retrieve a cached garth session string from DynamoDB.
+
+    Args:
+        user_id: The unique identifier for the user.
+
+    Returns:
+        Serialised garth session string, or None if not found.
+    """
+    try:
+        table = _get_table()
+        response = table.get_item(Key={"PK": f"USER#{user_id}", "SK": "GARMIN_SESSION"})
+        item = response.get("Item")
+        return item["sessionData"] if item else None
+    except Exception as e:
+        logger.error("Failed to retrieve Garmin session for user %s: %s", user_id, e)
+        return None
 
 
 def save_activities(user_id: str, activities: list[dict]) -> bool:
