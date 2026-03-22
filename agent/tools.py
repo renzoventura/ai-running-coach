@@ -194,7 +194,7 @@ def _trim_hr_day(raw: dict) -> dict:
     return result
 
 
-def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne") -> list:
+def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne", user_id: str | None = None) -> list:
     """
     Create Strands-compatible tool functions bound to a connected GarminClient.
 
@@ -223,42 +223,56 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
         """
         try:
             from datetime import date, timedelta
-            raw = garmin_client.get_recent_activities(days=28)
+            from services.dynamodb import get_cached_activities, save_activities
 
-            cutoff = (date.today() - timedelta(days=14)).isoformat()
-            trimmed = []
+            today = date.today()
+            fresh_cutoff = (today - timedelta(days=14)).isoformat()  # always re-fetch last 14 days
+            cache_cutoff = (today - timedelta(days=28)).isoformat()  # read cache for 14-28 days ago
+
+            # Fetch last 14 days fresh from Garmin
+            raw = garmin_client.get_recent_activities(days=14)
+            fresh_trimmed = []
             for activity in raw:
                 if not activity:
                     continue
 
-                # Fetch lap splits for recent running activities only
                 activity_type = activity.get("activityType", {})
                 type_key = activity_type.get("typeKey", "") if isinstance(activity_type, dict) else ""
                 is_running = "running" in str(type_key).lower()
 
-                # Use deterministic local date conversion for cutoff check
                 gmt = activity.get("startTimeGMT")
                 local_date = _to_local_date(gmt, local_tz) if gmt else str(activity.get("startTimeLocal", ""))[:10]
-                is_recent = (local_date or "") >= cutoff
 
-                if is_running and is_recent:
-                    activity_id = activity.get("activityId")
+                activity_id = activity.get("activityId")
+                if is_running and activity_id:
+                    splits = garmin_client.get_activity_splits(activity_id)
+                    lap_dtos = splits.get("lapDTOs") or splits.get("laps") or []
+                    if lap_dtos:
+                        activity = {**activity, "lapDTOs": lap_dtos}
+
+                trimmed = _trim_activity(activity, local_tz)
+                if trimmed:
                     if activity_id:
-                        splits = garmin_client.get_activity_splits(activity_id)
-                        lap_dtos = splits.get("lapDTOs") or splits.get("laps") or []
-                        logger.debug(
-                            "Activity %s raw lap fields: %s",
-                            activity_id,
-                            [list(lap.keys()) for lap in lap_dtos[:2]] if lap_dtos else "none",
-                        )
-                        if lap_dtos:
-                            activity = {**activity, "lapDTOs": lap_dtos}
+                        trimmed["activity_id"] = str(activity_id)
+                    fresh_trimmed.append(trimmed)
 
-                trimmed.append(_trim_activity(activity, local_tz))
+            # Persist fresh activities to cache
+            if user_id and fresh_trimmed:
+                save_activities(user_id, fresh_trimmed)
 
-            trimmed = [a for a in trimmed if a]
-            logger.info("get_recent_activities returning %d trimmed records", len(trimmed))
-            return trimmed
+            # Load older activities (14-28 days ago) from cache — no Garmin call needed
+            cached = []
+            if user_id:
+                all_cached = get_cached_activities(user_id, since_date=cache_cutoff)
+                cached = [a for a in all_cached if (a.get("date") or "") < fresh_cutoff]
+
+            combined = cached + fresh_trimmed
+            combined.sort(key=lambda a: a.get("date") or "")
+            logger.info(
+                "get_recent_activities: %d from cache, %d fresh, %d total",
+                len(cached), len(fresh_trimmed), len(combined),
+            )
+            return combined
         except Exception as e:
             logger.error("Failed to get recent activities: %s", e)
             return []

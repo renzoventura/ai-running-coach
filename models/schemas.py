@@ -69,3 +69,15 @@ class GetPlanResponse(BaseModel):
 
 class UserStatusResponse(BaseModel):
     onboarding_status: str  # "not_found" | "garmin_connected" | "complete"
+
+
+class ActivitySummary(BaseModel):
+    date: str           # YYYY-MM-DD
+    type: str           # e.g. "running", "cycling"
+    distance_km: float
+    duration_min: int | None = None
+    avg_pace: str | None = None   # "M:SS" per km
+
+
+class ActivitiesResponse(BaseModel):
+    activities: list[ActivitySummary]

@@ -130,6 +130,65 @@ Content-Type: application/json
 
 ---
 
+### `GET /activities`
+
+Returns cached Garmin activity records for a user. Reads from DynamoDB only — no Garmin API call. Activities are cached automatically each time the coaching agent calls `get_recent_activities` during a chat session.
+
+Use this on calendar load to show checkmarks on days where a run was recorded. The cache covers the last 28 days and is refreshed on every coaching chat.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `since` | `string` | No | ISO date (`YYYY-MM-DD`). Only return activities on or after this date. |
+
+#### Response Body — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `activities` | `array` | List of activity summaries sorted by date ascending |
+| `activities[].date` | `string` | ISO date the activity was recorded (`YYYY-MM-DD`) |
+| `activities[].type` | `string` | Activity type e.g. `"running"`, `"cycling"` |
+| `activities[].distance_km` | `number` | Distance in kilometres |
+| `activities[].duration_min` | `integer\|null` | Elapsed time in minutes |
+| `activities[].avg_pace` | `string\|null` | Average pace per km (`"M:SS"`) |
+
+#### Example Request
+
+```
+GET /activities?user_id=user_2abc123def456&since=2026-03-01
+```
+
+#### Example Response
+
+```json
+{
+  "activities": [
+    {
+      "date": "2026-03-18",
+      "type": "running",
+      "distance_km": 10.2,
+      "duration_min": 52,
+      "avg_pace": "5:06"
+    },
+    {
+      "date": "2026-03-20",
+      "type": "running",
+      "distance_km": 6.0,
+      "duration_min": 32,
+      "avg_pace": "5:20"
+    }
+  ]
+}
+```
+
+> **Calendar checkmarks:** Cross-reference `activities[].date` against your plan days. If a date has an activity of type `"running"` and a matching plan day, show the checkmark.
+
+> **Cache note:** The cache populates after the user's first coaching chat. If they've just completed onboarding, call `GET /activities` after the training plan is loaded — data may be empty until the first chat session.
+
+---
+
 ### `POST /chat/stream`
 
 Sends a message to the AI coach and streams the response token by token using Server-Sent Events (SSE). Routes to the **onboarding agent** if `onboardingStatus` is `"garmin_connected"`, or the **coaching agent** if `"complete"`. The conversation is saved to DynamoDB after the stream completes.

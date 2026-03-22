@@ -76,7 +76,7 @@ def run_agent(
     agent = Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=make_tools(garmin_client, timezone),
+        tools=make_tools(garmin_client, timezone, user_id=user_id),
     )
     prompt = _build_prompt(message, chat_history, timezone)
     logger.info("Running agent for user %s", user_id)
@@ -206,7 +206,7 @@ async def stream_agent(
     agent = Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=make_tools(garmin_client, timezone),
+        tools=make_tools(garmin_client, timezone, user_id=user_id),
     )
     prompt = _build_prompt(message, chat_history, timezone)
     logger.info("Streaming agent for user %s", user_id)
@@ -285,7 +285,7 @@ def generate_plan(
     agent = Agent(
         model=model,
         system_prompt=PLAN_SYSTEM_PROMPT,
-        tools=make_tools(garmin_client),
+        tools=make_tools(garmin_client, user_id=user_id),
     )
 
     prompt = (

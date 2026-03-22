@@ -365,14 +365,100 @@ def delete_user_data(user_id: str) -> bool:
         _delete_item(user_id, "CREDENTIALS")
         chat_count = _delete_items_with_prefix(user_id, "CHAT#")
         plan_count = _delete_items_with_prefix(user_id, "PLAN#")
+        activity_count = _delete_items_with_prefix(user_id, "ACTIVITY#")
         logger.info(
-            "Deleted all data for user %s — %d chat messages, %d plan days",
-            user_id, chat_count, plan_count,
+            "Deleted all data for user %s — %d chat messages, %d plan days, %d activities",
+            user_id, chat_count, plan_count, activity_count,
         )
         return True
     except Exception as e:
         logger.error("Failed to delete data for user %s: %s", user_id, e)
         return False
+
+
+def save_activities(user_id: str, activities: list[dict]) -> bool:
+    """
+    Upsert a list of trimmed activity dicts to DynamoDB.
+
+    SK format: ACTIVITY#<date>#<activity_id>
+    If an activity has no activity_id, falls back to date-only SK (may overwrite).
+
+    Args:
+        user_id: The unique identifier for the user.
+        activities: List of trimmed activity dicts from _trim_activity().
+                    Each must have at least a 'date' field.
+
+    Returns:
+        True if all saved successfully, False if any write failed.
+    """
+    if not activities:
+        return True
+    try:
+        table = _get_table()
+        with table.batch_writer() as batch:
+            for activity in activities:
+                date = activity.get("date")
+                if not date:
+                    continue
+                activity_id = activity.get("activity_id", date)
+                batch.put_item(Item={
+                    "PK": f"USER#{user_id}",
+                    "SK": f"ACTIVITY#{date}#{activity_id}",
+                    **{k: str(v) if isinstance(v, float) else v for k, v in activity.items()},
+                })
+        logger.info("Saved %d activities for user %s", len(activities), user_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to save activities for user %s: %s", user_id, e)
+        return False
+
+
+def get_cached_activities(user_id: str, since_date: str | None = None) -> list[dict]:
+    """
+    Retrieve cached activity records from DynamoDB, optionally filtered by date.
+
+    Args:
+        user_id: The unique identifier for the user.
+        since_date: ISO date string (YYYY-MM-DD). Only return activities on or after this date.
+                    If None, returns all stored activities.
+
+    Returns:
+        List of activity dicts sorted by date ascending.
+    """
+    try:
+        table = _get_table()
+        if since_date:
+            response = table.query(
+                KeyConditionExpression=(
+                    Key("PK").eq(f"USER#{user_id}") & Key("SK").between(
+                        f"ACTIVITY#{since_date}", "ACTIVITY#{}"
+                    )
+                ),
+                ScanIndexForward=True,
+            )
+        else:
+            response = table.query(
+                KeyConditionExpression=(
+                    Key("PK").eq(f"USER#{user_id}") & Key("SK").begins_with("ACTIVITY#")
+                ),
+                ScanIndexForward=True,
+            )
+        items = response.get("Items", [])
+        result = []
+        for item in items:
+            activity = {k: v for k, v in item.items() if k not in ("PK", "SK")}
+            # Restore floats that were stored as strings
+            for field in ("distance_km",):
+                if field in activity:
+                    try:
+                        activity[field] = float(activity[field])
+                    except (ValueError, TypeError):
+                        pass
+            result.append(activity)
+        return result
+    except Exception as e:
+        logger.error("Failed to retrieve cached activities for user %s: %s", user_id, e)
+        return []
 
 
 def get_chat_history(user_id: str, limit: int = 20) -> list[dict]:
