@@ -194,7 +194,7 @@ def _trim_hr_day(raw: dict) -> dict:
     return result
 
 
-def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne", user_id: str | None = None) -> list:
+def make_tools(garmin_client: GarminClient | None, timezone: str = "Australia/Melbourne", user_id: str | None = None) -> list:
     """
     Create Strands-compatible tool functions bound to a connected GarminClient.
 
@@ -211,6 +211,8 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
     except Exception:
         local_tz = ZoneInfo("Australia/Melbourne")
 
+    garmin_available = garmin_client is not None
+
     @tool
     def get_recent_activities() -> list[dict[str, Any]]:
         """
@@ -226,8 +228,15 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
             from services.dynamodb import get_cached_activities, save_activities
 
             today = date.today()
-            fresh_cutoff = (today - timedelta(days=14)).isoformat()  # always re-fetch last 14 days
-            cache_cutoff = (today - timedelta(days=28)).isoformat()  # read cache for 14-28 days ago
+            cache_cutoff = (today - timedelta(days=28)).isoformat()
+
+            if not garmin_available:
+                # Garmin offline — serve entirely from cache
+                cached = get_cached_activities(user_id, since_date=cache_cutoff) if user_id else []
+                logger.info("get_recent_activities (offline): %d cached records", len(cached))
+                return cached
+
+            fresh_cutoff = (today - timedelta(days=14)).isoformat()
 
             # Fetch last 14 days fresh from Garmin
             raw = garmin_client.get_recent_activities(days=14)
@@ -256,15 +265,12 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
                         trimmed["activity_id"] = str(activity_id)
                     fresh_trimmed.append(trimmed)
 
-            # Persist fresh activities to cache
             if user_id and fresh_trimmed:
                 save_activities(user_id, fresh_trimmed)
 
-            # Load older activities (14-28 days ago) from cache — no Garmin call needed
-            cached = []
-            if user_id:
-                all_cached = get_cached_activities(user_id, since_date=cache_cutoff)
-                cached = [a for a in all_cached if (a.get("date") or "") < fresh_cutoff]
+            # Load older activities (14-28 days ago) from cache
+            all_cached = get_cached_activities(user_id, since_date=cache_cutoff) if user_id else []
+            cached = [a for a in all_cached if (a.get("date") or "") < fresh_cutoff]
 
             combined = cached + fresh_trimmed
             combined.sort(key=lambda a: a.get("date") or "")
@@ -286,6 +292,8 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
         Returns nightly records including total sleep, deep sleep, REM sleep hours,
         and Garmin sleep score.
         """
+        if not garmin_available:
+            return [{"unavailable": "Garmin is temporarily offline. Sleep data cannot be retrieved right now."}]
         try:
             raw = garmin_client.get_sleep_data(days=7)
             trimmed = [_trim_sleep(s) for s in raw if s]
@@ -305,6 +313,8 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
         overtraining, or how their body is adapting to training. Returns training
         status, aerobic load, anaerobic load, and recovery time.
         """
+        if not garmin_available:
+            return {"unavailable": "Garmin is temporarily offline. Training load data cannot be retrieved right now."}
         try:
             raw = garmin_client.get_training_load(days=28)
             trimmed = _trim_training_load(raw)
@@ -323,6 +333,8 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
         fitness, or signs of fatigue or illness. Returns per-day records with
         resting HR, max HR, and HRV status.
         """
+        if not garmin_available:
+            return [{"unavailable": "Garmin is temporarily offline. Heart rate data cannot be retrieved right now."}]
         try:
             raw = garmin_client.get_heart_rate(days=7)
             daily = raw.get("dailyValues", [])

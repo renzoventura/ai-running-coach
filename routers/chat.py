@@ -96,8 +96,13 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         try:
             garmin_client = _get_garmin_client(request.user_id)
         except HTTPException as e:
-            yield f"data: [ERROR] {e.detail}\n\n"
-            return
+            if e.status_code == 404:
+                # Credentials missing — hard failure, can't proceed
+                yield f"data: [ERROR] {e.detail}\n\n"
+                return
+            # Garmin auth failed (503) — fall back to cached data
+            logger.warning("Garmin unavailable for user %s — running in offline mode", request.user_id)
+            garmin_client = None
 
         try:
             async for chunk in stream_agent(

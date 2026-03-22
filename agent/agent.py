@@ -192,24 +192,32 @@ async def stream_onboarding_agent(
 async def stream_agent(
     message: str,
     user_id: str,
-    garmin_client: GarminClient,
+    garmin_client: GarminClient | None,
     chat_history: list[dict] | None = None,
     timezone: str = "Australia/Melbourne",
 ):
     """
     Async generator that streams the agent response token by token.
 
-    Yields plain text chunks as they arrive from the model.
-    Tool calls (Garmin data fetching) happen silently before streaming begins.
+    Accepts garmin_client=None for offline/fallback mode — tools will serve
+    cached activity data and report other metrics as unavailable.
     """
     model = _build_model()
+    system = SYSTEM_PROMPT
+    if garmin_client is None:
+        system += (
+            "\n\nNote: Garmin Connect is temporarily unavailable. "
+            "The get_recent_activities tool will return cached data where available. "
+            "For sleep, training load, and heart rate, acknowledge to the user that "
+            "live data is unavailable right now and offer to help with what you have."
+        )
     agent = Agent(
         model=model,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system,
         tools=make_tools(garmin_client, timezone, user_id=user_id),
     )
     prompt = _build_prompt(message, chat_history, timezone)
-    logger.info("Streaming agent for user %s", user_id)
+    logger.info("Streaming agent for user %s (garmin_online=%s)", user_id, garmin_client is not None)
 
     full_response = []
     async for event in agent.stream_async(prompt):
