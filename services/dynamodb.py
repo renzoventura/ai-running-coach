@@ -18,24 +18,104 @@ def _get_table():
     return dynamodb.Table(_TABLE_NAME)
 
 
+def create_profile(user_id: str, onboarding_status: str = "garmin_connected") -> bool:
+    """
+    Create an initial user profile with the given onboarding status.
+
+    Args:
+        user_id: The unique identifier for the user.
+        onboarding_status: Initial status — "garmin_connected" after Garmin is linked.
+
+    Returns:
+        True if saved successfully, False otherwise.
+    """
+    try:
+        table = _get_table()
+        table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "PROFILE",
+                "onboardingStatus": onboarding_status,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        logger.info("Created profile for user %s (status=%s)", user_id, onboarding_status)
+        return True
+    except Exception as e:
+        logger.error("Failed to create profile for user %s: %s", user_id, e)
+        return False
+
+
+def update_profile_field(user_id: str, field: str, value: str) -> bool:
+    """
+    Update a single field on the user's profile.
+
+    Args:
+        user_id: The unique identifier for the user.
+        field: The DynamoDB attribute name to update.
+        value: The new value (string).
+
+    Returns:
+        True if updated successfully, False otherwise.
+    """
+    try:
+        table = _get_table()
+        table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"},
+            UpdateExpression="SET #f = :v",
+            ExpressionAttributeNames={"#f": field},
+            ExpressionAttributeValues={":v": value},
+        )
+        logger.info("Updated profile field '%s' for user %s", field, user_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to update profile field '%s' for user %s: %s", field, user_id, e)
+        return False
+
+
+def set_onboarding_status(user_id: str, status: str) -> bool:
+    """
+    Set the onboardingStatus field on the user's profile.
+
+    Args:
+        user_id: The unique identifier for the user.
+        status: "garmin_connected" | "complete"
+
+    Returns:
+        True if updated successfully, False otherwise.
+    """
+    return update_profile_field(user_id, "onboardingStatus", status)
+
+
+def get_user_profile(user_id: str) -> Optional[dict]:
+    """
+    Retrieve a user's profile from DynamoDB.
+
+    Returns all stored profile fields, or None if not found.
+    """
+    try:
+        table = _get_table()
+        response = table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
+        )
+        item = response.get("Item")
+        if not item:
+            logger.info("No profile found for user %s", user_id)
+            return None
+        # Return all fields except DynamoDB keys
+        return {k: v for k, v in item.items() if k not in ("PK", "SK")}
+    except Exception as e:
+        logger.error("Failed to retrieve profile for user %s: %s", user_id, e)
+        return None
+
+
 def save_user_profile(
     user_id: str,
     goal_race: str,
     target_time: str,
     training_days: int,
 ) -> bool:
-    """
-    Save or update a user's profile in DynamoDB.
-
-    Args:
-        user_id: The unique identifier for the user.
-        goal_race: The user's goal race (e.g. "Sydney Marathon 2026").
-        target_time: Target finish time (e.g. "3:45:00").
-        training_days: Number of days per week the user trains.
-
-    Returns:
-        True if saved successfully, False otherwise.
-    """
+    """Legacy profile save — kept for backwards compatibility."""
     try:
         table = _get_table()
         table.put_item(
@@ -53,36 +133,6 @@ def save_user_profile(
     except Exception as e:
         logger.error("Failed to save profile for user %s: %s", user_id, e)
         return False
-
-
-def get_user_profile(user_id: str) -> Optional[dict]:
-    """
-    Retrieve a user's profile from DynamoDB.
-
-    Args:
-        user_id: The unique identifier for the user.
-
-    Returns:
-        Dict with goalRace, targetTime, trainingDays, createdAt, or None if not found.
-    """
-    try:
-        table = _get_table()
-        response = table.get_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}
-        )
-        item = response.get("Item")
-        if not item:
-            logger.info("No profile found for user %s", user_id)
-            return None
-        return {
-            "goalRace": item["goalRace"],
-            "targetTime": item["targetTime"],
-            "trainingDays": item["trainingDays"],
-            "createdAt": item["createdAt"],
-        }
-    except Exception as e:
-        logger.error("Failed to retrieve profile for user %s: %s", user_id, e)
-        return None
 
 
 def save_credentials(

@@ -1,12 +1,18 @@
-"""Chat endpoint — receives a user message and returns the agent response."""
+"""Chat endpoint — routes to onboarding or coaching agent based on user status."""
 import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from agent.agent import run_agent, stream_agent
+from agent.agent import stream_agent, stream_onboarding_agent
 from models.schemas import ChatHistoryResponse, ChatMessage, ChatRequest, ChatResponse
-from services.dynamodb import get_chat_history, get_credentials, save_chat_message
+from services.dynamodb import (
+    get_chat_history,
+    get_credentials,
+    get_plan_days,
+    get_user_profile,
+    save_chat_message,
+)
 from services.garmin import GarminClient
 from services.kms import decrypt_password
 
@@ -14,72 +20,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    """
-    Run the Strands agent with the user's message and return its response.
-
-    Fetches Garmin credentials from DynamoDB, decrypts via KMS, connects to
-    Garmin, then runs the agent with recent chat history for context.
-    """
-    credentials = get_credentials(request.user_id)
-    if not credentials:
-        logger.info("No credentials found for user %s", request.user_id)
-        raise HTTPException(
-            status_code=404,
-            detail="User credentials not found. Please complete onboarding first.",
-        )
-
-    try:
-        plaintext_password = decrypt_password(credentials["garminPasswordEncrypted"])
-    except RuntimeError:
-        logger.error("Failed to decrypt credentials for user %s", request.user_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to retrieve Garmin credentials. Please try again.",
-        )
-
-    garmin_client = GarminClient()
-    connected = garmin_client.connect(credentials["garminEmail"], plaintext_password)
-    if not connected:
-        logger.error("Garmin Connect authentication failed for user %s", request.user_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to connect to Garmin. Please check your credentials and try again.",
-        )
-
-    chat_history = get_chat_history(request.user_id, limit=20)
-
-    try:
-        response = run_agent(
-            message=request.message,
-            user_id=request.user_id,
-            garmin_client=garmin_client,
-            chat_history=chat_history,
-            timezone=request.timezone,
-        )
-    except Exception:
-        logger.exception("Agent error for user %s", request.user_id)
-        raise HTTPException(status_code=500, detail="Agent error. Please try again.")
-
-    save_chat_message(
-        user_id=request.user_id,
-        role="user",
-        message=request.message,
-        conversation_id=request.user_id,
-    )
-    save_chat_message(
-        user_id=request.user_id,
-        role="assistant",
-        message=response,
-        conversation_id=request.user_id,
-    )
-
-    return ChatResponse(response=response)
-
-
-def _get_garmin_client(user_id: str) -> tuple[GarminClient, str]:
-    """Shared helper — fetch credentials, decrypt, connect. Returns (client, email)."""
+def _get_garmin_client(user_id: str) -> GarminClient:
+    """Fetch credentials, decrypt, and return a connected GarminClient."""
     credentials = get_credentials(user_id)
     if not credentials:
         raise HTTPException(status_code=404, detail="User credentials not found. Please complete onboarding first.")
@@ -92,7 +34,7 @@ def _get_garmin_client(user_id: str) -> tuple[GarminClient, str]:
     if not garmin_client.connect(credentials["garminEmail"], plaintext_password):
         logger.error("Garmin Connect authentication failed for user %s", user_id)
         raise HTTPException(status_code=503, detail="Unable to connect to Garmin. Please check your credentials and try again.")
-    return garmin_client, credentials["garminEmail"]
+    return garmin_client
 
 
 @router.post("/chat/stream")
@@ -100,14 +42,59 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
     """
     Stream the agent response token by token using Server-Sent Events.
 
-    The frontend should consume this with fetch + ReadableStream.
-    After streaming, the full conversation is saved to DynamoDB.
+    Routes to the onboarding agent if the user's profile is not yet complete,
+    or the coaching agent if onboarding is done.
+
+    After streaming, saves the conversation to DynamoDB. If the onboarding agent
+    completes setup during this turn, triggers initial training plan generation.
     """
-    garmin_client, _ = _get_garmin_client(request.user_id)
+    profile = get_user_profile(request.user_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found. Please connect your Garmin account first.",
+        )
+
+    onboarding_status = profile.get("onboardingStatus", "garmin_connected")
     chat_history = get_chat_history(request.user_id, limit=20)
 
-    async def event_stream():
+    async def onboarding_stream():
         full_response = []
+        try:
+            async for chunk in stream_onboarding_agent(
+                message=request.message,
+                user_id=request.user_id,
+                profile=profile,
+                chat_history=chat_history,
+                timezone=request.timezone,
+            ):
+                full_response.append(chunk)
+                sse_lines = "\n".join(f"data: {line}" for line in chunk.split("\n"))
+                yield f"{sse_lines}\n\n"
+        except Exception:
+            logger.exception("Onboarding agent error for user %s", request.user_id)
+            yield "data: [ERROR]\n\n"
+            return
+
+        yield "data: [DONE]\n\n"
+
+        complete_response = "".join(full_response)
+        save_chat_message(request.user_id, "user", request.message, request.user_id)
+        save_chat_message(request.user_id, "assistant", complete_response, request.user_id)
+
+        # If onboarding completed this turn, generate initial training plan
+        updated_profile = get_user_profile(request.user_id)
+        if updated_profile and updated_profile.get("onboardingStatus") == "complete":
+            _generate_initial_plan(request.user_id, updated_profile)
+
+    async def coaching_stream():
+        full_response = []
+        try:
+            garmin_client = _get_garmin_client(request.user_id)
+        except HTTPException as e:
+            yield f"data: [ERROR] {e.detail}\n\n"
+            return
+
         try:
             async for chunk in stream_agent(
                 message=request.message,
@@ -117,23 +104,53 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 timezone=request.timezone,
             ):
                 full_response.append(chunk)
-                # SSE multi-line: split on newlines and prefix each line with "data: "
-                # The SSE spec joins them back with \n on the client automatically
                 sse_lines = "\n".join(f"data: {line}" for line in chunk.split("\n"))
                 yield f"{sse_lines}\n\n"
         except Exception:
-            logger.exception("Streaming agent error for user %s", request.user_id)
+            logger.exception("Coaching agent error for user %s", request.user_id)
             yield "data: [ERROR]\n\n"
             return
 
         yield "data: [DONE]\n\n"
 
-        # Save to DynamoDB after stream completes
         complete_response = "".join(full_response)
         save_chat_message(request.user_id, "user", request.message, request.user_id)
         save_chat_message(request.user_id, "assistant", complete_response, request.user_id)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    if onboarding_status == "complete":
+        return StreamingResponse(coaching_stream(), media_type="text/event-stream")
+    return StreamingResponse(onboarding_stream(), media_type="text/event-stream")
+
+
+def _generate_initial_plan(user_id: str, profile: dict) -> None:
+    """Generate and save the initial training plan after onboarding completes."""
+    from agent.agent import generate_plan
+    from services.dynamodb import get_credentials, save_plan_day
+    from services.garmin import GarminClient
+    from services.kms import decrypt_password
+
+    # Skip if a plan already exists
+    if get_plan_days(user_id):
+        logger.info("Plan already exists for user %s — skipping generation", user_id)
+        return
+
+    try:
+        credentials = get_credentials(user_id)
+        if not credentials:
+            logger.error("Cannot generate plan — no credentials for user %s", user_id)
+            return
+        plaintext_password = decrypt_password(credentials["garminPasswordEncrypted"])
+        garmin_client = GarminClient()
+        if not garmin_client.connect(credentials["garminEmail"], plaintext_password):
+            logger.error("Cannot generate plan — Garmin auth failed for user %s", user_id)
+            return
+
+        days = generate_plan(user_id=user_id, garmin_client=garmin_client, user_profile=profile)
+        for day in days:
+            save_plan_day(user_id, day)
+        logger.info("Initial training plan generated for user %s", user_id)
+    except Exception:
+        logger.exception("Failed to generate initial plan for user %s", user_id)
 
 
 @router.get("/chat/history", response_model=ChatHistoryResponse)

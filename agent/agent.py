@@ -9,12 +9,12 @@ from zoneinfo import ZoneInfo
 from strands import Agent
 from strands.models import BedrockModel
 
-from agent.tools import make_tools
+from agent.tools import make_onboarding_tools, make_tools
 from services.garmin import GarminClient
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a running coach. Talk like a real coach would — direct, human, and to the point.
+COACHING_PROMPT = """You are a running coach. Talk like a real coach would — direct, human, and to the point.
 
 Keep responses short. Use markdown freely — bold key stats, bullet points for lists, headers if breaking down a topic. But don't overdo it, keep it conversational.
 
@@ -30,6 +30,29 @@ When asked about a workout or training period:
 2. Give your coaching take based solely on what you just showed.
 
 If you catch yourself about to say something you didn't see in the tool output, stop and don't say it."""
+
+# Keep SYSTEM_PROMPT as alias for backwards compatibility
+SYSTEM_PROMPT = COACHING_PROMPT
+
+ONBOARDING_PROMPT = """You are a friendly running coach welcoming a new athlete to their personalised training program.
+
+Your job is to get to know them through natural conversation — one question at a time. Don't fire a list of questions. Ask one, wait for the answer, save it using the save_profile tool, then ask the next.
+
+Collect the following in this order:
+1. Their name
+2. Their goal — options: first 5K, first 10K, first half marathon, first marathon, improve 5K time, improve 10K time, improve half marathon time, improve marathon time, base building
+3. Target race date (skip if goal is base building)
+4. Their current longest run (in km)
+5. How many days per week they can train
+6. Any injuries or physical limitations to be aware of (they can say none)
+
+After collecting each answer, immediately call save_profile(field, value) with the appropriate field name before asking the next question.
+
+Field names to use: name, goal, targetRaceDate, currentLongestRun, daysPerWeek, injuries
+
+Once all fields are saved, call complete_onboarding() and tell the athlete their training plan is being built using proven Hal Higdon and Pfitzinger methodology — tailored to their goal and fitness level. Keep it warm and encouraging.
+
+Never ask for information that has already been provided (check the profile context below)."""
 
 
 def run_agent(
@@ -74,17 +97,17 @@ def _build_prompt(
     message: str,
     chat_history: list[dict] | None,
     timezone: str,
+    extra_context: str = "",
 ) -> str:
-    from datetime import datetime
     try:
         local_tz = ZoneInfo(timezone)
     except Exception:
         local_tz = ZoneInfo("Australia/Melbourne")
     today_local = datetime.now(local_tz).strftime("%A, %d %B %Y")
 
-    # Only tell the agent today's local date — all activity dates in the tool data
-    # are already converted to the user's local timezone before reaching the agent.
     context = f"Today is {today_local}. All activity dates in the data are already in the user's local timezone.\n\n"
+    if extra_context:
+        context += extra_context + "\n\n"
 
     if chat_history:
         history_text = "\n".join(
@@ -95,8 +118,79 @@ def _build_prompt(
     return context + message
 
 
+def _profile_context(profile: dict) -> str:
+    """Format collected profile fields as context for the onboarding agent."""
+    fields = {
+        "name": "Name",
+        "goal": "Goal",
+        "targetRaceDate": "Target race date",
+        "currentLongestRun": "Current longest run",
+        "daysPerWeek": "Days per week",
+        "injuries": "Injuries",
+    }
+    collected = {label: profile[key] for key, label in fields.items() if key in profile and profile[key]}
+    if not collected:
+        return "No profile information collected yet."
+    lines = "\n".join(f"- {label}: {val}" for label, val in collected.items())
+    return f"Already collected from this athlete:\n{lines}"
+
+
 def _strip_thinking(text: str) -> str:
     return re.sub(r"<thinking>.*?</thinking>\n?", "", text, flags=re.DOTALL).strip()
+
+
+def run_onboarding_agent(
+    message: str,
+    user_id: str,
+    profile: dict,
+    chat_history: list[dict] | None = None,
+    timezone: str = "Australia/Melbourne",
+) -> str:
+    """
+    Run the onboarding agent for a user who has connected Garmin but not completed profile setup.
+
+    The agent collects name, goal, race date, longest run, days per week, and injuries
+    one question at a time, saving each answer via the save_profile tool.
+    When complete, it calls complete_onboarding() to flip the status to "complete".
+    """
+    model = _build_model()
+    agent = Agent(
+        model=model,
+        system_prompt=ONBOARDING_PROMPT,
+        tools=make_onboarding_tools(user_id),
+    )
+    prompt = _build_prompt(message, chat_history, timezone, extra_context=_profile_context(profile))
+    logger.info("Running onboarding agent for user %s", user_id)
+    result = agent(prompt)
+    return _strip_thinking(str(result))
+
+
+async def stream_onboarding_agent(
+    message: str,
+    user_id: str,
+    profile: dict,
+    chat_history: list[dict] | None = None,
+    timezone: str = "Australia/Melbourne",
+):
+    """
+    Async generator that streams the onboarding agent response token by token.
+    """
+    model = _build_model()
+    agent = Agent(
+        model=model,
+        system_prompt=ONBOARDING_PROMPT,
+        tools=make_onboarding_tools(user_id),
+    )
+    prompt = _build_prompt(message, chat_history, timezone, extra_context=_profile_context(profile))
+    logger.info("Streaming onboarding agent for user %s", user_id)
+
+    async for event in agent.stream_async(prompt):
+        if "data" in event and isinstance(event["data"], str):
+            yield event["data"]
+        elif "contentBlockDelta" in event:
+            chunk = event["contentBlockDelta"].get("delta", {}).get("text", "")
+            if chunk:
+                yield chunk
 
 
 async def stream_agent(

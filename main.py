@@ -5,7 +5,7 @@ import time
 from fastapi import FastAPI, Request
 from mangum import Mangum
 
-from routers import chat, onboard, health, training_plan, user
+from routers import chat, connect_garmin, health, training_plan, user
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +36,7 @@ async def log_requests(request: Request, call_next):
 
 
 app.include_router(chat.router)
-app.include_router(onboard.router)
+app.include_router(connect_garmin.router)
 app.include_router(health.router)
 app.include_router(training_plan.router)
 app.include_router(user.router)

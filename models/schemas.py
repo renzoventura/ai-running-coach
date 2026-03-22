@@ -12,16 +12,13 @@ class ChatResponse(BaseModel):
     response: str
 
 
-class OnboardRequest(BaseModel):
+class ConnectGarminRequest(BaseModel):
     user_id: str
-    goal_race: str
-    target_time: str
-    training_days: int
     garmin_email: str
     garmin_password: str
 
 
-class OnboardResponse(BaseModel):
+class ConnectGarminResponse(BaseModel):
     success: bool
     message: str
 

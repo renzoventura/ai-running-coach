@@ -321,3 +321,60 @@ def make_tools(garmin_client: GarminClient, timezone: str = "Australia/Melbourne
             return []
 
     return [get_recent_activities, get_sleep_data, get_training_load, get_heart_rate]
+
+
+def make_onboarding_tools(user_id: str) -> list:
+    """
+    Create tools for the onboarding agent.
+
+    The onboarding agent does not have access to Garmin data — it only needs
+    to save profile fields progressively and signal when onboarding is complete.
+
+    Args:
+        user_id: The Clerk userId to save profile data against.
+
+    Returns:
+        List of tool functions: save_profile and complete_onboarding.
+    """
+    from services.dynamodb import set_onboarding_status, update_profile_field
+
+    @tool
+    def save_profile(field: str, value: str) -> str:
+        """
+        Save a single profile field for the user.
+
+        Call this immediately after the user provides each piece of information.
+        Do not wait until all fields are collected — save each answer as soon as you have it.
+
+        Args:
+            field: One of: name, goal, targetRaceDate, currentLongestRun, daysPerWeek, injuries
+            value: The value provided by the user (as a string).
+
+        Returns:
+            Confirmation string.
+        """
+        allowed = {"name", "goal", "targetRaceDate", "currentLongestRun", "daysPerWeek", "injuries"}
+        if field not in allowed:
+            logger.warning("Onboarding agent tried to save unknown field: %s", field)
+            return f"Unknown field '{field}'. Allowed: {', '.join(sorted(allowed))}"
+        update_profile_field(user_id, field, value)
+        logger.info("Onboarding saved field '%s' for user %s", field, user_id)
+        return f"Saved {field}."
+
+    @tool
+    def complete_onboarding() -> str:
+        """
+        Call this once you have collected and saved all required profile fields:
+        name, goal, targetRaceDate (if applicable), currentLongestRun, daysPerWeek, injuries.
+
+        This marks the user's onboarding as complete and triggers training plan generation.
+        Tell the user their personalised training plan is being generated.
+
+        Returns:
+            Confirmation string.
+        """
+        set_onboarding_status(user_id, "complete")
+        logger.info("Onboarding complete for user %s", user_id)
+        return "Onboarding complete. Training plan will be generated."
+
+    return [save_profile, complete_onboarding]

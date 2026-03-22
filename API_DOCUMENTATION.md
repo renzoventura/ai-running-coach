@@ -20,18 +20,15 @@ The API does not currently enforce authentication middleware. The frontend is ex
 
 ## Endpoints
 
-### `POST /onboard`
+### `POST /connect-garmin`
 
-Saves a new user's profile and Garmin Connect credentials. The Garmin password is encrypted with AWS KMS before being stored in DynamoDB. Call this once when a user signs up or updates their Garmin credentials.
+Links a Garmin Connect account to the user and initialises their profile. The Garmin password is encrypted with AWS KMS before being stored in DynamoDB. After this, the user is guided through profile setup conversationally via `POST /chat/stream`.
 
 #### Request Body
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `user_id` | `string` | Yes | Clerk userId of the authenticated user |
-| `goal_race` | `string` | Yes | The user's target race (e.g. `"Sydney Marathon 2026"`) |
-| `target_time` | `string` | Yes | Target finish time in `HH:MM:SS` format (e.g. `"3:45:00"`) |
-| `training_days` | `integer` | Yes | Number of days per week the user trains (e.g. `4`) |
 | `garmin_email` | `string` | Yes | Garmin Connect account email address |
 | `garmin_password` | `string` | Yes | Garmin Connect account password (encrypted at rest via KMS) |
 
@@ -39,8 +36,8 @@ Saves a new user's profile and Garmin Connect credentials. The Garmin password i
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `boolean` | `true` if onboarding completed successfully |
-| `message` | `string` | Human-readable confirmation message |
+| `success` | `boolean` | `true` if Garmin was connected successfully |
+| `message` | `string` | Human-readable confirmation |
 
 #### Error Responses
 
@@ -49,19 +46,16 @@ Saves a new user's profile and Garmin Connect credentials. The Garmin password i
 | `500` | `"Server configuration error."` | `KMS_KEY_ID` environment variable not set |
 | `500` | `"Failed to secure credentials. Please try again."` | KMS encryption failed |
 | `500` | `"Failed to save credentials. Please try again."` | DynamoDB write failed for credentials |
-| `500` | `"Failed to save profile. Please try again."` | DynamoDB write failed for profile |
+| `500` | `"Failed to create profile. Please try again."` | DynamoDB write failed for profile |
 
 #### Example Request
 
 ```json
-POST /onboard
+POST /connect-garmin
 Content-Type: application/json
 
 {
   "user_id": "user_2abc123def456",
-  "goal_race": "Sydney Marathon 2026",
-  "target_time": "3:45:00",
-  "training_days": 4,
   "garmin_email": "runner@example.com",
   "garmin_password": "my-garmin-password"
 }
@@ -72,9 +66,21 @@ Content-Type: application/json
 ```json
 {
   "success": true,
-  "message": "Onboarding complete."
+  "message": "Garmin connected. Starting onboarding."
 }
 ```
+
+---
+
+## Onboarding Flow
+
+After `POST /connect-garmin`, the user's `onboardingStatus` is set to `"garmin_connected"`. The first messages to `POST /chat/stream` are handled by the **onboarding agent**, which:
+
+1. Collects name, goal, target race date, current longest run, days per week, and injuries — one question at a time
+2. Saves each answer immediately to DynamoDB as it's collected
+3. Once all fields are collected, sets `onboardingStatus` to `"complete"` and generates an initial training plan
+
+Once `onboardingStatus` is `"complete"`, all subsequent chat messages are handled by the **coaching agent**, which has full access to the user's Garmin data and training history.
 
 ---
 
