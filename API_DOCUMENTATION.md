@@ -12,17 +12,75 @@ The AI Running Coach backend is a FastAPI application that provides personalised
 
 ## Authentication
 
-The API does not currently enforce authentication middleware. The frontend is expected to pass the **Clerk `userId`** as the `user_id` field in every request body. This value is used as the partition key for all DynamoDB records (stored as `USER#<userId>`).
+The API does not currently enforce authentication middleware. The frontend is expected to pass the **Clerk `userId`** as the `user_id` field in every request body or query parameter. This value is used as the partition key for all DynamoDB records (stored as `USER#<userId>`).
 
-> **Planned:** A future middleware layer will validate the Clerk session token from the `Authorization: Bearer <token>` header and verify that the `user_id` in the request body matches the authenticated Clerk user before processing.
+> **Planned:** A future middleware layer will validate the Clerk session token from the `Authorization: Bearer <token>` header and verify that the `user_id` in the request matches the authenticated Clerk user before processing.
+
+---
+
+## Onboarding Flow
+
+The full user journey after Clerk signup:
+
+1. **`POST /connect-garmin`** — link Garmin account, sets `onboardingStatus` to `"garmin_connected"`
+2. **`GET /user/status`** — frontend checks status on load to decide which screen to show
+3. **`POST /chat/stream`** — onboarding agent asks 4 questions one at a time, saving each answer to DynamoDB
+4. After the 4th answer, the agent calls `complete_onboarding()` internally — sets `onboardingStatus` to `"complete"` and triggers background training plan generation
+5. Frontend detects `"complete"` status (via `GET /user/status` after stream `[DONE]`) and transitions to coaching view
+6. **`GET /training-plan`** — fetch the generated plan and display it
+
+Once `onboardingStatus` is `"complete"`, all subsequent `POST /chat/stream` messages are handled by the **coaching agent**, which has full access to the user's Garmin data and training history.
+
+**Onboarding questions (in order):**
+1. Name
+2. Goal — First 5K / First 10K / First half marathon / First marathon / Just run consistently
+3. Target race date — skipped if goal is "Just run consistently"
+4. Days per week — 3, 4, or 5
 
 ---
 
 ## Endpoints
 
+### `GET /user/status`
+
+Returns the user's onboarding status. Call this on app load to decide which screen to show, and after each onboarding stream completes to detect when onboarding finishes.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+
+#### Response Body — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `onboarding_status` | `string` | `"not_found"` · `"garmin_connected"` · `"complete"` |
+
+**Status meanings:**
+- `"not_found"` → no profile exists, show Connect Garmin screen
+- `"garmin_connected"` → Garmin linked but onboarding not finished, go to chat (onboarding agent will guide them)
+- `"complete"` → onboarding done, go to coaching chat
+
+#### Example Request
+
+```
+GET /user/status?user_id=user_2abc123def456
+```
+
+#### Example Response
+
+```json
+{
+  "onboarding_status": "complete"
+}
+```
+
+---
+
 ### `POST /connect-garmin`
 
-Links a Garmin Connect account to the user and initialises their profile. The Garmin password is encrypted with AWS KMS before being stored in DynamoDB. After this, the user is guided through profile setup conversationally via `POST /chat/stream`.
+Links a Garmin Connect account to the user and initialises their profile. The Garmin password is encrypted with AWS KMS before being stored in DynamoDB. After this, send the user to `POST /chat/stream` where the onboarding agent will guide them through setup.
 
 #### Request Body
 
@@ -72,85 +130,29 @@ Content-Type: application/json
 
 ---
 
-## Onboarding Flow
+### `POST /chat/stream`
 
-After `POST /connect-garmin`, the user's `onboardingStatus` is set to `"garmin_connected"`. The first messages to `POST /chat/stream` are handled by the **onboarding agent**, which:
+Sends a message to the AI coach and streams the response token by token using Server-Sent Events (SSE). Routes to the **onboarding agent** if `onboardingStatus` is `"garmin_connected"`, or the **coaching agent** if `"complete"`. The conversation is saved to DynamoDB after the stream completes.
 
-1. Collects name, goal, target race date, current longest run, days per week, and injuries — one question at a time
-2. Saves each answer immediately to DynamoDB as it's collected
-3. Once all fields are collected, sets `onboardingStatus` to `"complete"` and generates an initial training plan
+On each request the coaching agent:
 
-Once `onboardingStatus` is `"complete"`, all subsequent chat messages are handled by the **coaching agent**, which has full access to the user's Garmin data and training history.
-
----
-
-### `POST /chat`
-
-Sends a message to the AI running coach and returns a personalised response. On each request the backend:
-
-1. Fetches the user's Garmin credentials from DynamoDB and decrypts them via KMS
+1. Fetches Garmin credentials from DynamoDB and decrypts via KMS
 2. Authenticates with Garmin Connect
-3. Retrieves the last 20 messages of chat history for conversation context
-4. Runs the Strands agent (Claude Haiku 4.5) which can call any of the following tools:
+3. Retrieves the last 20 messages of chat history for context
+4. Runs the Strands agent (Claude Haiku 4.5) which can call:
    - `get_recent_activities` — last 28 days of runs
    - `get_sleep_data` — last 7 nights of sleep
    - `get_training_load` — training load and recovery metrics
    - `get_heart_rate` — resting HR and 7-day trends
-5. Saves the user message and agent response to DynamoDB
-6. Returns the agent's response
+5. Streams the response, then saves both messages to DynamoDB
 
 #### Request Body
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `user_id` | `string` | Yes | Clerk userId of the authenticated user |
-| `message` | `string` | Yes | The user's message or question for the coaching agent |
+| `message` | `string` | Yes | The user's message |
 | `timezone` | `string` | No | IANA timezone string (default `"Australia/Melbourne"`). Use `Intl.DateTimeFormat().resolvedOptions().timeZone` on the frontend. |
-
-#### Response Body — `200 OK`
-
-| Field | Type | Description |
-|---|---|---|
-| `response` | `string` | The AI coach's response in markdown format |
-
-#### Error Responses
-
-| Status | Detail | Cause |
-|---|---|---|
-| `404` | `"User credentials not found. Please complete onboarding first."` | No Garmin credentials found for this `user_id` |
-| `503` | `"Unable to retrieve Garmin credentials. Please try again."` | KMS decryption failed |
-| `503` | `"Unable to connect to Garmin. Please check your credentials and try again."` | Garmin Connect authentication failed (wrong credentials or Garmin service down) |
-| `500` | `"Agent error. Please try again."` | Bedrock model error or agent execution failure |
-
-#### Example Request
-
-```json
-POST /chat
-Content-Type: application/json
-
-{
-  "user_id": "user_2abc123def456",
-  "message": "How did my training go this week?"
-}
-```
-
-#### Example Response
-
-```json
-{
-  "response": "## Weekly Training Overview\n\n**Running Performance:**\n- You've maintained consistent training with a good mix of easy runs, tempo work, and long runs\n- Your average pace has been well-controlled across different intensity zones\n\n**Training Load & Recovery:**\n- **Training Status:** PRODUCTIVE — your body is adapting well\n- **Resting Heart Rate:** 40 bpm — excellent cardiovascular fitness\n- **HRV:** BALANCED — nervous system is recovering well\n\n**Recommendations:**\n1. Maintain current training structure — it's working\n2. Add one easy long run to build aerobic base\n3. Don't increase weekly mileage by more than 10%\n\nYou're doing great! Keep it up 💪"
-}
-```
-
----
-
-### `POST /chat/stream`
-
-Same as `POST /chat` but streams the response token by token using Server-Sent Events (SSE). The conversation is saved to DynamoDB after the stream completes.
-
-#### Request Body
-
-Same as `POST /chat` (`user_id`, `message`, `timezone`).
 
 #### Response — `text/event-stream`
 
@@ -165,37 +167,70 @@ data: [DONE]\n\n
 
 `[DONE]` signals the stream is complete. `[ERROR]` signals a failure mid-stream.
 
+#### Error Responses
+
+| Status | Detail | Cause |
+|---|---|---|
+| `404` | `"User not found. Please connect your Garmin account first."` | No profile found for this `user_id` |
+| `404` | `"User credentials not found. Please complete onboarding first."` | No Garmin credentials found (coaching agent only) |
+| `503` | `"Unable to retrieve Garmin credentials. Please try again."` | KMS decryption failed |
+| `503` | `"Unable to connect to Garmin. Please check your credentials and try again."` | Garmin Connect authentication failed |
+
 #### Frontend Usage
 
 ```js
-const res = await fetch("http://localhost:8000/chat/stream", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ user_id, message, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
-});
+useEffect(() => {
+  const controller = new AbortController();
 
-const reader = res.body.getReader();
-const decoder = new TextDecoder();
+  async function startStream() {
+    const res = await fetch("http://localhost:8000/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id,
+        message,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      }),
+      signal: controller.signal,
+    });
 
-while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  const text = decoder.decode(value);
-  for (const line of text.split("\n")) {
-    if (line.startsWith("data: ")) {
-      const chunk = line.slice(6);
-      if (chunk === "[DONE]" || chunk === "[ERROR]") break;
-      appendToMessage(chunk); // render incrementally
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value);
+      for (const line of text.split("\n")) {
+        if (line.startsWith("data: ")) {
+          const chunk = line.slice(6);
+          if (chunk === "[DONE]" || chunk === "[ERROR]") return;
+          appendToMessage(chunk); // render incrementally
+        }
+      }
     }
   }
-}
+
+  startStream();
+  return () => controller.abort(); // cancel on re-render (prevents double-stream in React StrictMode)
+}, []);
 ```
+
+> **Important:** Always use `AbortController` to cancel the fetch on cleanup. Without it, React StrictMode will fire two concurrent streams and interleave their chunks, corrupting the output.
+
+#### After Onboarding Completes
+
+When the onboarding agent finishes collecting all 4 answers, it calls `complete_onboarding()` internally. After receiving `[DONE]`:
+
+1. Call `GET /user/status` — if it returns `"complete"`, onboarding just finished
+2. Transition to coaching chat view
+3. Call `GET /training-plan` to load and display the generated plan
 
 ---
 
 ### `GET /chat/history`
 
-Returns the saved chat history for a user, newest messages first. Use this on page load to restore previous conversation state in the frontend.
+Returns the saved chat history for a user, newest messages first. Use this on page load to restore previous conversation state.
 
 #### Query Parameters
 
@@ -242,11 +277,13 @@ GET /chat/history?user_id=user_2abc123def456&limit=50
 
 ### `POST /training-plan/generate`
 
-Generates a personalised 7-day training plan starting from the next Monday. On each request the backend:
+Manually triggers training plan generation for a user. Normally the initial plan is generated automatically when onboarding completes — use this endpoint to regenerate a plan on demand.
 
-1. Fetches the user's profile (goal race, target time, training days) from DynamoDB
+On each request the backend:
+
+1. Fetches the user's profile (goal, target race date, training days) from DynamoDB
 2. Fetches Garmin credentials, decrypts via KMS, and authenticates with Garmin Connect
-3. Runs the Strands agent (Claude Haiku 4.5) which uses Garmin tools to assess current fitness before generating the plan
+3. Runs the Strands agent (Claude Haiku 4.5) which uses Garmin tools to assess current fitness
 4. Saves one DynamoDB item per day (`SK: PLAN#YYYY-MM-DD`)
 5. Returns the generated week
 
@@ -377,13 +414,81 @@ GET /training-plan?user_id=user_2abc123def456
 
 ---
 
+### `DELETE /conversation`
+
+Deletes all chat history for a user. Profile and Garmin credentials are preserved — the user does not need to re-onboard.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+
+#### Response Body — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | `boolean` | `true` if conversation was cleared |
+| `message` | `string` | Human-readable confirmation |
+
+#### Example Request
+
+```
+DELETE /conversation?user_id=user_2abc123def456
+```
+
+#### Example Response
+
+```json
+{
+  "success": true,
+  "message": "Conversation cleared."
+}
+```
+
+---
+
+### `DELETE /user`
+
+Deletes all data for a user from DynamoDB — profile, Garmin credentials, chat history, and training plan. The user will need to complete onboarding again after this.
+
+> **Note:** This does not delete the Clerk account. Handle Clerk account deletion on the frontend using Clerk's `deleteUser()` method.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+
+#### Response Body — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | `boolean` | `true` if user data was deleted |
+| `message` | `string` | Human-readable confirmation |
+
+#### Example Request
+
+```
+DELETE /user?user_id=user_2abc123def456
+```
+
+#### Example Response
+
+```json
+{
+  "success": true,
+  "message": "User data deleted. Please complete onboarding again."
+}
+```
+
+> **Frontend:** After this completes, call `GET /user/status` — it will return `"not_found"`. Clear all local state (chat history, plan data, onboarding status) and redirect to the Connect Garmin screen.
+
+---
+
 ### `GET /health`
 
-Health check endpoint. Use this to verify the service is running.
-
-#### Request Body
-
-None.
+Health check endpoint.
 
 #### Response Body — `200 OK`
 
@@ -409,7 +514,7 @@ GET /health
 
 ## Error Response Format
 
-All error responses follow FastAPI's default error format:
+All error responses follow FastAPI's default format:
 
 ```json
 {
@@ -424,7 +529,7 @@ All error responses follow FastAPI's default error format:
 Start the server:
 
 ```bash
-source .env
+set -a && source .env && set +a
 uvicorn main:app --reload
 ```
 
