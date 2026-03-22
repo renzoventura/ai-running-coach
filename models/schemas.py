@@ -65,3 +65,7 @@ class GeneratePlanResponse(BaseModel):
 
 class GetPlanResponse(BaseModel):
     weeks: list[PlanWeek]
+
+
+class UserStatusResponse(BaseModel):
+    onboarding_status: str  # "not_found" | "garmin_connected" | "complete"

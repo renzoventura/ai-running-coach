@@ -3,11 +3,31 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from models.schemas import DeleteResponse
-from services.dynamodb import clear_chat_history, delete_user_data
+from models.schemas import DeleteResponse, UserStatusResponse
+from services.dynamodb import clear_chat_history, delete_user_data, get_user_profile
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.get("/user/status", response_model=UserStatusResponse)
+def get_user_status(user_id: str) -> UserStatusResponse:
+    """
+    Return the user's onboarding status.
+
+    Frontend should call this on load to decide which screen to show:
+    - "not_found" → show Connect Garmin screen
+    - "garmin_connected" → show chat (onboarding agent will guide them)
+    - "complete" → show chat (coaching agent)
+
+    Query param:
+        user_id: Clerk userId of the authenticated user.
+    """
+    profile = get_user_profile(user_id)
+    if not profile:
+        return UserStatusResponse(onboarding_status="not_found")
+    status = profile.get("onboardingStatus", "garmin_connected")
+    return UserStatusResponse(onboarding_status=status)
 
 
 @router.delete("/conversation", response_model=DeleteResponse)
