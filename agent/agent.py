@@ -291,9 +291,10 @@ def generate_plan(
     prompt = (
         f"Generate a 7-day training plan starting Monday {week_start.isoformat()}.\n\n"
         f"User profile:\n"
-        f"- Goal race: {user_profile.get('goalRace', 'unspecified')}\n"
-        f"- Target time: {user_profile.get('targetTime', 'unspecified')}\n"
-        f"- Training days per week: {user_profile.get('trainingDays', 'unspecified')}\n\n"
+        f"- Name: {user_profile.get('name', 'unspecified')}\n"
+        f"- Goal: {user_profile.get('goal', 'unspecified')}\n"
+        f"- Target race date: {user_profile.get('targetRaceDate', 'none')}\n"
+        f"- Training days per week: {user_profile.get('daysPerWeek', 'unspecified')}\n\n"
         f"Use the available tools to check the user's recent activities, sleep, training load, "
         f"and heart rate before generating the plan. Tailor intensity and volume accordingly.\n\n"
         f"Respond with ONLY the raw JSON array — no markdown, no explanation."

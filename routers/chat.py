@@ -1,4 +1,5 @@
 """Chat endpoint — routes to onboarding or coaching agent based on user status."""
+import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
@@ -82,10 +83,13 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         save_chat_message(request.user_id, "user", request.message, request.user_id)
         save_chat_message(request.user_id, "assistant", complete_response, request.user_id)
 
-        # If onboarding completed this turn, generate initial training plan
+        # If onboarding completed this turn, generate initial training plan in a thread
+        # so it doesn't block the async event loop (Garmin auth + Bedrock calls are slow)
         updated_profile = get_user_profile(request.user_id)
         if updated_profile and updated_profile.get("onboardingStatus") == "complete":
-            _generate_initial_plan(request.user_id, updated_profile)
+            asyncio.get_event_loop().run_in_executor(
+                None, _generate_initial_plan, request.user_id, updated_profile
+            )
 
     async def coaching_stream():
         full_response = []
