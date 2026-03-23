@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from models.schemas import ConnectGarminRequest, ConnectGarminResponse
 from services.dynamodb import create_profile, save_credentials
+from services.garmin import GarminClient
 from services.kms import encrypt_password
 
 logger = logging.getLogger(__name__)
@@ -17,10 +18,20 @@ def connect_garmin(request: ConnectGarminRequest) -> ConnectGarminResponse:
     """
     Link a Garmin account to a user and initialise their profile.
 
-    Encrypts the Garmin password with KMS, saves credentials to DynamoDB,
-    and creates a user profile with onboardingStatus set to "garmin_connected".
-    The user will then be guided through profile setup via the /chat/stream endpoint.
+    Validates the Garmin credentials by attempting a real login before saving.
+    If login succeeds, encrypts the password with KMS, saves credentials to
+    DynamoDB, caches the Garmin session, and creates a user profile with
+    onboardingStatus set to "garmin_connected".
     """
+    # Validate credentials first — fail fast before storing anything
+    garmin_client = GarminClient()
+    if not garmin_client.connect(request.garmin_email, request.garmin_password, user_id=request.user_id):
+        logger.warning("Garmin credential validation failed for user %s", request.user_id)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Garmin credentials. Please check your email and password and try again.",
+        )
+
     kms_key_id = os.environ.get("KMS_KEY_ID")
     if not kms_key_id:
         logger.error("KMS_KEY_ID environment variable is not set")
