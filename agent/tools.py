@@ -379,7 +379,7 @@ def make_onboarding_tools(user_id: str) -> list:
         Returns:
             Confirmation string.
         """
-        allowed = {"name", "goal", "targetRaceDate", "currentLongestRun", "daysPerWeek", "injuries"}
+        allowed = {"name", "goal", "targetRaceDate", "daysPerWeek"}
         if field not in allowed:
             logger.warning("Onboarding agent tried to save unknown field: %s", field)
             return f"Unknown field '{field}'. Allowed: {', '.join(sorted(allowed))}"
@@ -391,7 +391,7 @@ def make_onboarding_tools(user_id: str) -> list:
     def complete_onboarding() -> str:
         """
         Call this once you have collected and saved all required profile fields:
-        name, goal, targetRaceDate (if applicable), currentLongestRun, daysPerWeek, injuries.
+        name, goal, targetRaceDate (if applicable), daysPerWeek.
 
         This marks the user's onboarding as complete and triggers training plan generation.
         Tell the user their personalised training plan is being generated.

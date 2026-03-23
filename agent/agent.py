@@ -109,10 +109,10 @@ def _build_prompt(
 
     if chat_history:
         history_text = "\n".join(
-            f"{entry['role'].capitalize()}: {entry['message']}"
+            f"{'Athlete' if entry['role'] == 'user' else 'Coach'}: {entry['message']}"
             for entry in reversed(chat_history)
         )
-        return f"{context}Previous conversation:\n{history_text}\n\nUser: {message}"
+        return f"{context}Previous conversation:\n{history_text}\n\nAthlete: {message}"
     return context + message
 
 
