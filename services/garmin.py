@@ -42,28 +42,55 @@ class GarminClient:
 
     def _full_login(self, email: str, password: str) -> bool:
         """
-        Perform a full Garmin Connect login. Never logs credentials.
+        Perform a full Garmin Connect login with one retry on transient failures.
+        Never logs credentials.
 
         Raises:
             PermissionError: If Garmin returns 429 (rate limited).
             ValueError: If credentials are invalid (401).
         """
+        import time
+        last_err = None
+        for attempt in range(2):
+            try:
+                client = garminconnect.Garmin(email, password)
+                client.login()
+                self._client = client
+                logger.info("Garmin full login successful (attempt %d)", attempt + 1)
+                return True
+            except Exception as e:
+                err = str(e)
+                if "429" in err:
+                    logger.warning("Garmin rate limit hit during login")
+                    raise PermissionError("rate_limited")
+                if "401" in err:
+                    logger.warning("Garmin login rejected — invalid credentials")
+                    raise ValueError("invalid_credentials")
+                last_err = e
+                if attempt == 0:
+                    logger.warning("Garmin login attempt 1 failed (%s) — retrying in 3s", e)
+                    time.sleep(3)
+        logger.error("Garmin full login failed after 2 attempts: %s", last_err)
+        return False
+
+    def persist_session(self, user_id: str) -> None:
+        """
+        Save the current garth session tokens to memory and DynamoDB caches.
+
+        Call this after any successful Garmin API use to keep tokens fresh —
+        garth may have silently refreshed the OAuth2 access token during the
+        request, and we want that updated token persisted for next time.
+        """
+        if not self._client or not user_id:
+            return
         try:
-            client = garminconnect.Garmin(email, password)
-            client.login()
-            self._client = client
-            logger.info("Garmin full login successful")
-            return True
+            session_data = self._client.garth.dumps()
+            _session_cache[user_id] = session_data
+            from services.dynamodb import save_garmin_session
+            save_garmin_session(user_id, session_data)
+            logger.debug("Persisted refreshed Garmin session for user %s", user_id)
         except Exception as e:
-            err = str(e)
-            if "429" in err:
-                logger.warning("Garmin rate limit hit during login")
-                raise PermissionError("rate_limited")
-            if "401" in err:
-                logger.warning("Garmin login rejected — invalid credentials")
-                raise ValueError("invalid_credentials")
-            logger.error("Garmin full login failed: %s", e)
-            return False
+            logger.warning("Failed to persist Garmin session for user %s: %s", user_id, e)
 
     def connect(self, email: str, password: str, user_id: str | None = None) -> bool:
         """

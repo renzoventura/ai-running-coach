@@ -23,7 +23,8 @@ def connect_garmin(request: ConnectGarminRequest) -> ConnectGarminResponse:
     DynamoDB, caches the Garmin session, and creates a user profile with
     onboardingStatus set to "garmin_connected".
     """
-    # Validate credentials first — fail fast before storing anything
+    # Validate credentials — connect() checks memory/DynamoDB cache first,
+    # only does a full login if no valid session exists
     garmin_client = GarminClient()
     try:
         connected = garmin_client.connect(request.garmin_email, request.garmin_password, user_id=request.user_id)

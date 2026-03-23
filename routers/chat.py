@@ -132,6 +132,10 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         save_chat_message(request.user_id, "user", request.message, request.user_id)
         save_chat_message(request.user_id, "assistant", complete_response, request.user_id)
 
+        # Persist any refreshed OAuth tokens back to cache
+        if garmin_client:
+            garmin_client.persist_session(request.user_id)
+
     if onboarding_status == "complete":
         return StreamingResponse(coaching_stream(), media_type="text/event-stream")
     return StreamingResponse(onboarding_stream(), media_type="text/event-stream")
