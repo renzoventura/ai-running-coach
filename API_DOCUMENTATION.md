@@ -80,7 +80,7 @@ GET /user/status?user_id=user_2abc123def456
 
 ### `POST /connect-garmin`
 
-Links a Garmin Connect account to the user and initialises their profile. The Garmin password is encrypted with AWS KMS before being stored in DynamoDB. After this, send the user to `POST /chat/stream` where the onboarding agent will guide them through setup.
+Links a Garmin Connect account to the user and initialises their profile. Validates the credentials by attempting a real Garmin login before saving anything — returns `401` immediately if they are wrong. On success, the password is encrypted with AWS KMS before being stored in DynamoDB, and the Garmin session is cached so the first chat needs no re-authentication. After this, send the user to `POST /chat/stream` where the onboarding agent will guide them through setup.
 
 #### Request Body
 
@@ -101,6 +101,7 @@ Links a Garmin Connect account to the user and initialises their profile. The Ga
 
 | Status | Detail | Cause |
 |---|---|---|
+| `401` | `"Invalid Garmin credentials. Please check your email and password and try again."` | Garmin login failed — wrong email or password |
 | `500` | `"Server configuration error."` | `KMS_KEY_ID` environment variable not set |
 | `500` | `"Failed to secure credentials. Please try again."` | KMS encryption failed |
 | `500` | `"Failed to save credentials. Please try again."` | DynamoDB write failed for credentials |
