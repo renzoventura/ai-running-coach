@@ -25,11 +25,25 @@ def connect_garmin(request: ConnectGarminRequest) -> ConnectGarminResponse:
     """
     # Validate credentials first — fail fast before storing anything
     garmin_client = GarminClient()
-    if not garmin_client.connect(request.garmin_email, request.garmin_password, user_id=request.user_id):
-        logger.warning("Garmin credential validation failed for user %s", request.user_id)
+    try:
+        connected = garmin_client.connect(request.garmin_email, request.garmin_password, user_id=request.user_id)
+    except PermissionError:
+        logger.warning("Garmin rate limit hit for user %s", request.user_id)
+        raise HTTPException(
+            status_code=429,
+            detail="Garmin is temporarily rate limiting connections. Please wait a few minutes and try again.",
+        )
+    except ValueError:
+        logger.warning("Invalid Garmin credentials for user %s", request.user_id)
         raise HTTPException(
             status_code=401,
             detail="Invalid Garmin credentials. Please check your email and password and try again.",
+        )
+    if not connected:
+        logger.error("Garmin connection returned False for user %s", request.user_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to connect to Garmin. Please try again.",
         )
 
     kms_key_id = os.environ.get("KMS_KEY_ID")

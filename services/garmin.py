@@ -41,7 +41,13 @@ class GarminClient:
             return False
 
     def _full_login(self, email: str, password: str) -> bool:
-        """Perform a full Garmin Connect login. Never logs credentials."""
+        """
+        Perform a full Garmin Connect login. Never logs credentials.
+
+        Raises:
+            PermissionError: If Garmin returns 429 (rate limited).
+            ValueError: If credentials are invalid (401).
+        """
         try:
             client = garminconnect.Garmin(email, password)
             client.login()
@@ -49,6 +55,13 @@ class GarminClient:
             logger.info("Garmin full login successful")
             return True
         except Exception as e:
+            err = str(e)
+            if "429" in err:
+                logger.warning("Garmin rate limit hit during login")
+                raise PermissionError("rate_limited")
+            if "401" in err:
+                logger.warning("Garmin login rejected — invalid credentials")
+                raise ValueError("invalid_credentials")
             logger.error("Garmin full login failed: %s", e)
             return False
 
@@ -86,7 +99,7 @@ class GarminClient:
                 _session_cache[user_id] = cached  # warm memory cache
                 return True
 
-        # 3. Full login
+        # 3. Full login — let PermissionError/ValueError propagate to caller
         if not self._full_login(email, password):
             return False
 

@@ -32,9 +32,15 @@ def _get_garmin_client(user_id: str) -> GarminClient:
         logger.error("Failed to decrypt credentials for user %s", user_id)
         raise HTTPException(status_code=503, detail="Unable to retrieve Garmin credentials. Please try again.")
     garmin_client = GarminClient()
-    if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
+    try:
+        connected = garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id)
+    except PermissionError:
+        raise HTTPException(status_code=429, detail="Garmin is temporarily rate limiting connections. Please wait a few minutes and try again.")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Garmin credentials are invalid. Please reconnect your Garmin account.")
+    if not connected:
         logger.error("Garmin Connect authentication failed for user %s", user_id)
-        raise HTTPException(status_code=503, detail="Unable to connect to Garmin. Please check your credentials and try again.")
+        raise HTTPException(status_code=503, detail="Unable to connect to Garmin. Please try again.")
     return garmin_client
 
 
