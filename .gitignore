@@ -12,3 +12,5 @@ build/
 .aws-sam/
 samconfig.toml
 garmin_debug_dump.json
+.claude/
+seed_garmin_tokens.py
