@@ -5,7 +5,7 @@
 
 set -e
 
-EC2_IP="${EC2_IP:-YOUR_EC2_IP}"
+EC2_IP="${EC2_IP:-13.54.81.73}"
 SSH_KEY="${SSH_KEY:-~/.ssh/ai-run-coach.pem}"
 
 echo "=== Deploying to $EC2_IP ==="
