@@ -463,6 +463,42 @@ def get_garmin_session(user_id: str) -> Optional[str]:
         return None
 
 
+def save_garmin_rate_limit(user_id: str, blocked_until: float) -> None:
+    """
+    Record a Garmin rate-limit event so the connect() flow skips re-login attempts
+    until the cooldown window has elapsed.
+
+    Args:
+        user_id: The unique identifier for the user.
+        blocked_until: Unix timestamp after which login attempts are permitted again.
+    """
+    try:
+        table = _get_table()
+        table.put_item(Item={
+            "PK": f"USER#{user_id}",
+            "SK": "GARMIN_RATE_LIMIT",
+            "blockedUntil": str(blocked_until),
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.error("Failed to save Garmin rate limit for user %s: %s", user_id, e)
+
+
+def get_garmin_rate_limit(user_id: str) -> float:
+    """
+    Return the Unix timestamp until which Garmin login attempts are blocked,
+    or 0.0 if no active rate limit is recorded.
+    """
+    try:
+        table = _get_table()
+        response = table.get_item(Key={"PK": f"USER#{user_id}", "SK": "GARMIN_RATE_LIMIT"})
+        item = response.get("Item")
+        return float(item["blockedUntil"]) if item else 0.0
+    except Exception as e:
+        logger.error("Failed to retrieve Garmin rate limit for user %s: %s", user_id, e)
+        return 0.0
+
+
 def save_activities(user_id: str, activities: list[dict]) -> bool:
     """
     Upsert a list of trimmed activity dicts to DynamoDB.

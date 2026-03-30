@@ -155,6 +155,15 @@ class GarminClient:
         Returns:
             True if authenticated successfully, False otherwise.
         """
+        import time
+        # 0. Check rate limit backoff — if we hit 429 recently, skip all login attempts
+        if user_id:
+            from services.dynamodb import get_garmin_rate_limit
+            blocked_until = get_garmin_rate_limit(user_id)
+            if blocked_until and time.time() < blocked_until:
+                logger.warning("Garmin login blocked until %s (rate limit backoff)", blocked_until)
+                raise PermissionError("rate_limited")
+
         # 1. In-memory cache
         if user_id and user_id in _session_cache:
             if self._try_restore(email, _session_cache[user_id]):
@@ -170,9 +179,17 @@ class GarminClient:
                 _session_cache[user_id] = cached  # warm memory cache
                 return True
 
-        # 3. Full login — let PermissionError/ValueError propagate to caller
-        if not self._full_login(email, password):
-            return False
+        # 3. Full login
+        try:
+            if not self._full_login(email, password):
+                return False
+        except PermissionError:
+            # 429 — record a 24h backoff so subsequent requests don't keep hammering
+            if user_id:
+                from services.dynamodb import save_garmin_rate_limit
+                save_garmin_rate_limit(user_id, time.time() + 86400)
+                logger.warning("Garmin 429 — saved 24h rate limit backoff for user %s", user_id)
+            raise
 
         # Save fresh session to both caches
         if user_id and self._client:
