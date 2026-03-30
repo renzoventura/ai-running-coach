@@ -5,17 +5,20 @@ import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from agent.agent import stream_agent, stream_onboarding_agent
+from agent.agent import stream_agent, stream_onboarding_agent, stream_strava_agent
 from models.schemas import ChatHistoryResponse, ChatMessage, ChatRequest, ChatResponse
 from services.dynamodb import (
     get_chat_history,
     get_credentials,
     get_plan_days,
+    get_strava_credentials,
     get_user_profile,
     save_chat_message,
+    save_strava_credentials,
 )
 from services.garmin import GarminClient
 from services.kms import decrypt_password
+from services.strava import StravaClient
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -63,6 +66,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         )
 
     onboarding_status = profile.get("onboardingStatus", "garmin_connected")
+    data_source = profile.get("dataSource", "garmin")
     chat_history = get_chat_history(request.user_id, limit=20)
 
     async def onboarding_stream():
@@ -136,38 +140,121 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         if garmin_client:
             garmin_client.persist_session(request.user_id)
 
+    async def strava_coaching_stream():
+        import time as _time
+        full_response = []
+
+        creds = get_strava_credentials(request.user_id)
+        if not creds:
+            yield "data: [ERROR] Strava credentials not found. Please reconnect your Strava account.\n\n"
+            return
+
+        # Auto-refresh access token if expired (5-minute buffer)
+        access_token = creds["access_token"]
+        if _time.time() >= creds["expires_at"] - 300:
+            try:
+                new_tokens = StravaClient().refresh_access_token(creds["refresh_token"])
+                access_token = new_tokens["access_token"]
+                save_strava_credentials(
+                    user_id=request.user_id,
+                    athlete_id=creds["athlete_id"],
+                    access_token=access_token,
+                    refresh_token=creds["refresh_token"],
+                    expires_at=new_tokens["expires_at"],
+                )
+            except RuntimeError:
+                logger.warning("Strava token refresh failed for user %s — using existing token", request.user_id)
+
+        try:
+            async for chunk in stream_strava_agent(
+                message=request.message,
+                user_id=request.user_id,
+                access_token=access_token,
+                athlete_id=creds["athlete_id"],
+                chat_history=chat_history,
+                timezone=request.timezone,
+            ):
+                full_response.append(chunk)
+                sse_lines = "\n".join(f"data: {line}" for line in chunk.split("\n"))
+                yield f"{sse_lines}\n\n"
+        except Exception:
+            logger.exception("Strava coaching agent error for user %s", request.user_id)
+            yield "data: [ERROR]\n\n"
+            return
+
+        yield "data: [DONE]\n\n"
+
+        complete_response = "".join(full_response)
+        save_chat_message(request.user_id, "user", request.message, request.user_id)
+        save_chat_message(request.user_id, "assistant", complete_response, request.user_id)
+
     if onboarding_status == "complete":
+        if data_source == "strava":
+            return StreamingResponse(strava_coaching_stream(), media_type="text/event-stream")
         return StreamingResponse(coaching_stream(), media_type="text/event-stream")
     return StreamingResponse(onboarding_stream(), media_type="text/event-stream")
 
 
 def _generate_initial_plan(user_id: str, profile: dict) -> None:
     """Generate and save the initial training plan after onboarding completes."""
-    from agent.agent import generate_plan
-    from services.dynamodb import get_credentials, save_plan_day
-    from services.garmin import GarminClient
-    from services.kms import decrypt_password
+    from services.dynamodb import save_plan_day
 
-    # Skip if a plan already exists
     if get_plan_days(user_id):
         logger.info("Plan already exists for user %s — skipping generation", user_id)
         return
 
-    try:
-        credentials = get_credentials(user_id)
-        if not credentials:
-            logger.error("Cannot generate plan — no credentials for user %s", user_id)
-            return
-        plaintext_password = decrypt_password(credentials["garminPasswordEncrypted"])
-        garmin_client = GarminClient()
-        if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
-            logger.error("Cannot generate plan — Garmin auth failed for user %s", user_id)
-            return
+    data_source = profile.get("dataSource", "garmin")
 
-        days = generate_plan(user_id=user_id, garmin_client=garmin_client, user_profile=profile)
+    try:
+        if data_source == "strava":
+            import time as _time
+            from agent.agent import generate_plan_strava
+            from services.dynamodb import get_strava_credentials, save_strava_credentials
+            from services.strava import StravaClient
+
+            strava_creds = get_strava_credentials(user_id)
+            if not strava_creds:
+                logger.error("Cannot generate plan — no Strava credentials for user %s", user_id)
+                return
+
+            access_token = strava_creds["access_token"]
+            if _time.time() >= strava_creds["expires_at"] - 300:
+                new_tokens = StravaClient().refresh_access_token(strava_creds["refresh_token"])
+                access_token = new_tokens["access_token"]
+                save_strava_credentials(
+                    user_id=user_id,
+                    athlete_id=strava_creds["athlete_id"],
+                    access_token=access_token,
+                    refresh_token=strava_creds["refresh_token"],
+                    expires_at=new_tokens["expires_at"],
+                )
+
+            days = generate_plan_strava(
+                user_id=user_id,
+                access_token=access_token,
+                athlete_id=strava_creds["athlete_id"],
+                user_profile=profile,
+            )
+        else:
+            from agent.agent import generate_plan
+            from services.dynamodb import get_credentials
+            from services.garmin import GarminClient
+            from services.kms import decrypt_password
+
+            credentials = get_credentials(user_id)
+            if not credentials:
+                logger.error("Cannot generate plan — no Garmin credentials for user %s", user_id)
+                return
+            plaintext_password = decrypt_password(credentials["garminPasswordEncrypted"])
+            garmin_client = GarminClient()
+            if not garmin_client.connect(credentials["garminEmail"], plaintext_password, user_id=user_id):
+                logger.error("Cannot generate plan — Garmin auth failed for user %s", user_id)
+                return
+            days = generate_plan(user_id=user_id, garmin_client=garmin_client, user_profile=profile)
+
         for day in days:
             save_plan_day(user_id, day)
-        logger.info("Initial training plan generated for user %s", user_id)
+        logger.info("Initial training plan generated (%s) for user %s", data_source, user_id)
     except Exception:
         logger.exception("Failed to generate initial plan for user %s", user_id)
 

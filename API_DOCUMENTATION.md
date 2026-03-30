@@ -2,7 +2,11 @@
 
 ## Overview
 
-The AI Running Coach backend is a FastAPI application that provides personalised running coaching powered by Garmin Connect data and Amazon Bedrock (Claude Haiku 4.5). The API is deployed as an AWS Lambda function via Mangum and can also be run locally with uvicorn.
+The AI Running Coach backend is a FastAPI application that provides personalised running coaching powered by fitness data and Amazon Bedrock (Claude Haiku 4.5). The API is deployed as an AWS Lambda function via Mangum and can also be run locally with uvicorn.
+
+The backend supports **two data sources**:
+- **Garmin Connect** — full data: activities, sleep, resting HR, training load
+- **Strava** — activity data only (sleep and resting HR not available via Strava)
 
 **Base URL (local):** `http://localhost:8000`
 
@@ -18,20 +22,39 @@ The API does not currently enforce authentication middleware. The frontend is ex
 
 ---
 
-## Onboarding Flow
+## Onboarding Flows
 
-The full user journey after Clerk signup:
+### Garmin Flow
 
-1. **`POST /connect-garmin`** — link Garmin account, sets `onboardingStatus` to `"garmin_connected"`
+1. **`POST /connect-garmin`** — link Garmin account, sets `onboardingStatus` to `"garmin_connected"`, `dataSource` to `"garmin"`
 2. **`GET /user/status`** — frontend checks status on load to decide which screen to show
-3. **`POST /chat/stream`** — onboarding agent asks 4 questions one at a time, saving each answer to DynamoDB
+3. **`POST /chat/stream`** — onboarding agent asks 4 questions one at a time, saving each answer
 4. After the 4th answer, the agent calls `complete_onboarding()` internally — sets `onboardingStatus` to `"complete"` and triggers background training plan generation
-5. Frontend detects `"complete"` status (via `GET /user/status` after stream `[DONE]`) and transitions to coaching view
+5. Frontend detects `"complete"` (via `GET /user/status` after stream `[DONE]`) and transitions to coaching view
 6. **`GET /training-plan`** — fetch the generated plan and display it
 
-Once `onboardingStatus` is `"complete"`, all subsequent `POST /chat/stream` messages are handled by the **coaching agent**, which has full access to the user's Garmin data and training history.
+### Strava Flow
 
-**Onboarding questions (in order):**
+1. Frontend redirects user to Strava's OAuth authorization URL (see below), passing `user_id` as the `state` param
+2. User authorises on Strava
+3. **`GET /auth/strava/callback`** — Strava redirects here with `code` and `state`. Backend exchanges code for tokens, saves credentials, creates profile with `dataSource="strava"`, pre-caches last 28 days of activities to DynamoDB, then redirects browser to `FRONTEND_URL/chat`
+4. **`GET /user/status`** — returns `"garmin_connected"` (same status, different source), `data_source: "strava"`
+5. **`POST /chat/stream`** — onboarding agent collects name, goal, race date, days per week
+6. After onboarding completes, training plan is generated in the background using Strava activity data to calibrate starting mileage
+7. Coaching agent uses Strava tools (no sleep or HR data available)
+
+**Strava OAuth authorization URL** (frontend initiates this redirect):
+```
+https://www.strava.com/oauth/authorize
+  ?client_id=<STRAVA_CLIENT_ID>
+  &redirect_uri=<API_BASE_URL>/auth/strava/callback
+  &response_type=code
+  &approval_prompt=auto
+  &scope=activity:read_all
+  &state=<clerk_user_id>
+```
+
+### Onboarding questions (both flows, in order)
 1. Name
 2. Goal — First 5K / First 10K / First half marathon / First marathon / Just run consistently
 3. Target race date — skipped if goal is "Just run consistently"
@@ -43,7 +66,7 @@ Once `onboardingStatus` is `"complete"`, all subsequent `POST /chat/stream` mess
 
 ### `GET /user/status`
 
-Returns the user's onboarding status. Call this on app load to decide which screen to show, and after each onboarding stream completes to detect when onboarding finishes.
+Returns the user's onboarding status and data source. Call this on app load to decide which screen to show, and after each onboarding stream completes to detect when onboarding finishes.
 
 #### Query Parameters
 
@@ -56,23 +79,19 @@ Returns the user's onboarding status. Call this on app load to decide which scre
 | Field | Type | Description |
 |---|---|---|
 | `onboarding_status` | `string` | `"not_found"` · `"garmin_connected"` · `"complete"` |
+| `data_source` | `string` | `"garmin"` or `"strava"` (default `"garmin"`) |
 
 **Status meanings:**
-- `"not_found"` → no profile exists, show Connect Garmin screen
-- `"garmin_connected"` → Garmin linked but onboarding not finished, go to chat (onboarding agent will guide them)
+- `"not_found"` → no profile exists, show Connect screen (Garmin or Strava)
+- `"garmin_connected"` → data source linked but onboarding not finished, go to chat
 - `"complete"` → onboarding done, go to coaching chat
-
-#### Example Request
-
-```
-GET /user/status?user_id=user_2abc123def456
-```
 
 #### Example Response
 
 ```json
 {
-  "onboarding_status": "complete"
+  "onboarding_status": "complete",
+  "data_source": "strava"
 }
 ```
 
@@ -80,39 +99,38 @@ GET /user/status?user_id=user_2abc123def456
 
 ### `POST /connect-garmin`
 
-Links a Garmin Connect account to the user and initialises their profile. Validates the credentials by attempting a real Garmin login before saving anything — returns `401` immediately if they are wrong. On success, the password is encrypted with AWS KMS before being stored in DynamoDB, and the Garmin session is cached so the first chat needs no re-authentication. After this, send the user to `POST /chat/stream` where the onboarding agent will guide them through setup.
+Links a Garmin Connect account to the user and initialises their profile. Validates credentials by attempting a real Garmin login before saving — returns `401` immediately if wrong. On success, password is encrypted with AWS KMS before being stored.
 
 #### Request Body
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
-| `garmin_email` | `string` | Yes | Garmin Connect account email address |
-| `garmin_password` | `string` | Yes | Garmin Connect account password (encrypted at rest via KMS) |
+| `user_id` | `string` | Yes | Clerk userId |
+| `garmin_email` | `string` | Yes | Garmin Connect email |
+| `garmin_password` | `string` | Yes | Garmin Connect password (encrypted at rest via KMS) |
 
 #### Response Body — `200 OK`
 
 | Field | Type | Description |
 |---|---|---|
-| `success` | `boolean` | `true` if Garmin was connected successfully |
+| `success` | `boolean` | `true` if connected successfully |
 | `message` | `string` | Human-readable confirmation |
 
 #### Error Responses
 
 | Status | Detail | Cause |
 |---|---|---|
-| `401` | `"Invalid Garmin credentials. Please check your email and password and try again."` | Garmin login failed — wrong email or password |
-| `500` | `"Server configuration error."` | `KMS_KEY_ID` environment variable not set |
+| `401` | `"Invalid Garmin credentials..."` | Wrong email or password |
+| `429` | `"Garmin is temporarily rate limiting connections..."` | Too many login attempts — wait and retry |
+| `500` | `"Server configuration error."` | `KMS_KEY_ID` env var not set |
 | `500` | `"Failed to secure credentials. Please try again."` | KMS encryption failed |
-| `500` | `"Failed to save credentials. Please try again."` | DynamoDB write failed for credentials |
-| `500` | `"Failed to create profile. Please try again."` | DynamoDB write failed for profile |
+| `500` | `"Failed to save credentials. Please try again."` | DynamoDB write failed |
+| `503` | `"Unable to connect to Garmin. Please try again."` | Transient Garmin error |
 
 #### Example Request
 
 ```json
 POST /connect-garmin
-Content-Type: application/json
-
 {
   "user_id": "user_2abc123def456",
   "garmin_email": "runner@example.com",
@@ -131,17 +149,126 @@ Content-Type: application/json
 
 ---
 
+### `GET /auth/strava/callback`
+
+Strava OAuth callback endpoint — Strava redirects here after the user authorises. Exchanges the authorization code for tokens, saves credentials to DynamoDB, creates a profile with `dataSource="strava"`, and redirects the browser to `FRONTEND_URL/chat`.
+
+**The frontend does not call this directly.** Strava calls it after the user approves access.
+
+#### Query Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `code` | `string` | Authorization code from Strava |
+| `state` | `string` | Clerk `user_id` passed as the OAuth state param |
+| `error` | `string` | Set by Strava if the user denied access |
+
+#### Response
+
+- **Success** → `302` redirect to `FRONTEND_URL/chat`
+- **Denied** → `302` redirect to `FRONTEND_URL?strava_error=access_denied`
+- **502** → Strava token exchange failed (Strava API error)
+
+---
+
+### `POST /auth/strava/refresh`
+
+Refreshes a Strava access token if it has expired. Called automatically by the chat stream — frontends do not need to call this directly.
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId |
+
+#### Response Body — `200 OK`
+
+| Field | Type | Description |
+|---|---|---|
+| `refreshed` | `boolean` | `true` if token was refreshed, `false` if still valid |
+| `message` | `string` | Human-readable status |
+
+#### Error Responses
+
+| Status | Detail | Cause |
+|---|---|---|
+| `404` | `"No Strava credentials found for this user."` | User has not connected Strava |
+| `502` | `"Failed to refresh Strava token."` | Strava API error |
+
+---
+
+### `POST /activities/sync`
+
+Fetches activities for a specific date range from the user's data source (Strava), caches them to DynamoDB, and returns the results. Call this when the user navigates to a new calendar month.
+
+> **Strava only.** Garmin activities are cached automatically during chat sessions.
+
+#### Request Body
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `user_id` | `string` | Yes | Clerk userId |
+| `since` | `string` | Yes | Start date inclusive (`YYYY-MM-DD`) |
+| `until` | `string` | Yes | End date inclusive (`YYYY-MM-DD`) |
+
+#### Response Body — `200 OK`
+
+Same shape as `GET /activities` — `{ activities: ActivitySummary[] }`.
+
+#### Error Responses
+
+| Status | Detail | Cause |
+|---|---|---|
+| `400` | `"On-demand sync is only supported for Strava users."` | User has Garmin as data source |
+| `404` | `"User not found."` | No profile for this `user_id` |
+| `404` | `"Strava credentials not found."` | User has not connected Strava |
+| `502` | `"Failed to refresh Strava token."` | Strava token refresh failed |
+
+#### Example Request
+
+```json
+POST /activities/sync
+{
+  "user_id": "user_2abc123def456",
+  "since": "2026-02-01",
+  "until": "2026-02-28"
+}
+```
+
+#### Frontend Usage
+
+```js
+// Called when user navigates to a new month
+async function syncMonth(userId, year, month) {
+  const since = `${year}-${String(month).padStart(2, '0')}-01`;
+  const lastDay = new Date(year, month, 0).getDate();
+  const until = `${year}-${String(month).padStart(2, '0')}-${lastDay}`;
+
+  const res = await fetch("http://localhost:8000/activities/sync", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, since, until }),
+  });
+  const { activities } = await res.json();
+  return activities;
+}
+```
+
+---
+
 ### `GET /activities`
 
-Returns cached Garmin activity records for a user. Reads from DynamoDB only — no Garmin API call. Activities are cached automatically each time the coaching agent calls `get_recent_activities` during a chat session.
+Returns cached activity records for a user. Reads from DynamoDB only — no live API call.
 
-Use this on calendar load to show checkmarks on days where a run was recorded. The cache covers the last 28 days and is refreshed on every coaching chat.
+**When activities are cached:**
+- **Strava:** Pre-cached immediately on `GET /auth/strava/callback` (28 days). Refreshed on every chat session and on `POST /activities/sync`.
+- **Garmin:** Cached on every chat session when the agent calls `get_recent_activities`.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 | `since` | `string` | No | ISO date (`YYYY-MM-DD`). Only return activities on or after this date. |
 
 #### Response Body — `200 OK`
@@ -149,17 +276,11 @@ Use this on calendar load to show checkmarks on days where a run was recorded. T
 | Field | Type | Description |
 |---|---|---|
 | `activities` | `array` | List of activity summaries sorted by date ascending |
-| `activities[].date` | `string` | ISO date the activity was recorded (`YYYY-MM-DD`) |
-| `activities[].type` | `string` | Activity type e.g. `"running"`, `"cycling"` |
+| `activities[].date` | `string` | ISO date (`YYYY-MM-DD`) |
+| `activities[].type` | `string` | `"running"`, `"cycling"`, etc. |
 | `activities[].distance_km` | `number` | Distance in kilometres |
 | `activities[].duration_min` | `integer\|null` | Elapsed time in minutes |
 | `activities[].avg_pace` | `string\|null` | Average pace per km (`"M:SS"`) |
-
-#### Example Request
-
-```
-GET /activities?user_id=user_2abc123def456&since=2026-03-01
-```
 
 #### Example Response
 
@@ -172,69 +293,59 @@ GET /activities?user_id=user_2abc123def456&since=2026-03-01
       "distance_km": 10.2,
       "duration_min": 52,
       "avg_pace": "5:06"
-    },
-    {
-      "date": "2026-03-20",
-      "type": "running",
-      "distance_km": 6.0,
-      "duration_min": 32,
-      "avg_pace": "5:20"
     }
   ]
 }
 ```
 
-> **Calendar checkmarks:** Cross-reference `activities[].date` against your plan days. If a date has an activity of type `"running"` and a matching plan day, show the checkmark.
-
-> **Cache note:** The cache populates after the user's first coaching chat. If they've just completed onboarding, call `GET /activities` after the training plan is loaded — data may be empty until the first chat session.
+> **Calendar checkmarks:** Cross-reference `activities[].date` against plan days. If a date has a `"running"` activity and a matching plan day, show the checkmark.
 
 ---
 
 ### `POST /chat/stream`
 
-Sends a message to the AI coach and streams the response token by token using Server-Sent Events (SSE). Routes to the **onboarding agent** if `onboardingStatus` is `"garmin_connected"`, or the **coaching agent** if `"complete"`. The conversation is saved to DynamoDB after the stream completes.
+Sends a message to the AI coach and streams the response token by token using Server-Sent Events (SSE).
 
-On each request the coaching agent:
+**Routing logic:**
+- `onboardingStatus = "garmin_connected"` → **onboarding agent** (same for Garmin and Strava)
+- `onboardingStatus = "complete"` + `dataSource = "garmin"` → **Garmin coaching agent**
+- `onboardingStatus = "complete"` + `dataSource = "strava"` → **Strava coaching agent**
 
-1. Fetches Garmin credentials from DynamoDB and decrypts via KMS
-2. Authenticates with Garmin Connect
-3. Retrieves the last 20 messages of chat history for context
-4. Runs the Strands agent (Claude Haiku 4.5) which can call:
-   - `get_recent_activities` — last 28 days of runs
-   - `get_sleep_data` — last 7 nights of sleep
-   - `get_training_load` — training load and recovery metrics
-   - `get_heart_rate` — resting HR and 7-day trends
-5. Streams the response, then saves both messages to DynamoDB
+**Garmin coaching agent** calls:
+- `get_recent_activities` — last 28 days of runs (fresh 14 days + DynamoDB cache)
+- `get_sleep_data` — last 7 nights
+- `get_training_load` — training status and recovery metrics
+- `get_heart_rate` — resting HR and 7-day trends
+
+**Strava coaching agent** calls:
+- `get_recent_activities` — last 28 days from Strava API
+- `get_sleep_data` — returns a note that sleep is unavailable via Strava
+- `get_training_load` — Strava athlete stats (recent and YTD totals)
+- `get_heart_rate` — returns a note that resting HR is unavailable via Strava
 
 #### Request Body
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 | `message` | `string` | Yes | The user's message |
-| `timezone` | `string` | No | IANA timezone string (default `"Australia/Melbourne"`). Use `Intl.DateTimeFormat().resolvedOptions().timeZone` on the frontend. |
+| `timezone` | `string` | No | IANA timezone string (default `"Australia/Melbourne"`). Use `Intl.DateTimeFormat().resolvedOptions().timeZone`. |
 
 #### Response — `text/event-stream`
 
-Each chunk is sent as an SSE `data` event:
-
 ```
-data: Good session\n\n
-data:  yesterday\n\n
-data: . Take it easy today.\n\n
+data: Good session yesterday.\n\n
+data:  Take it easy today.\n\n
 data: [DONE]\n\n
 ```
 
-`[DONE]` signals the stream is complete. `[ERROR]` signals a failure mid-stream.
+`[DONE]` signals completion. `[ERROR]` signals failure mid-stream.
 
 #### Error Responses
 
 | Status | Detail | Cause |
 |---|---|---|
-| `404` | `"User not found. Please connect your Garmin account first."` | No profile found for this `user_id` |
-| `404` | `"User credentials not found. Please complete onboarding first."` | No Garmin credentials found (coaching agent only) |
-| `503` | `"Unable to retrieve Garmin credentials. Please try again."` | KMS decryption failed |
-| `503` | `"Unable to connect to Garmin. Please check your credentials and try again."` | Garmin Connect authentication failed |
+| `404` | `"User not found..."` | No profile for this `user_id` |
 
 #### Frontend Usage
 
@@ -265,81 +376,55 @@ useEffect(() => {
         if (line.startsWith("data: ")) {
           const chunk = line.slice(6);
           if (chunk === "[DONE]" || chunk === "[ERROR]") return;
-          appendToMessage(chunk); // render incrementally
+          appendToMessage(chunk);
         }
       }
     }
   }
 
   startStream();
-  return () => controller.abort(); // cancel on re-render (prevents double-stream in React StrictMode)
+  return () => controller.abort(); // prevents double-stream in React StrictMode
 }, []);
 ```
 
-> **Important:** Always use `AbortController` to cancel the fetch on cleanup. Without it, React StrictMode will fire two concurrent streams and interleave their chunks, corrupting the output.
-
 #### After Onboarding Completes
 
-When the onboarding agent finishes collecting all 4 answers, it calls `complete_onboarding()` internally. After receiving `[DONE]`:
+When the onboarding agent finishes, it calls `complete_onboarding()` internally. After receiving `[DONE]`:
 
-1. Call `GET /user/status` — if it returns `"complete"`, onboarding just finished
+1. Call `GET /user/status` — if `"complete"`, onboarding finished
 2. Transition to coaching chat view
-3. Call `GET /training-plan` to load and display the generated plan
+3. Call `GET /training-plan` to load and display the plan (poll every 5s until `weeks` has data)
 
 ---
 
 ### `GET /chat/history`
 
-Returns the saved chat history for a user, newest messages first. Use this on page load to restore previous conversation state.
+Returns saved chat history for a user, newest first.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 | `limit` | `integer` | No | Max messages to return (default `50`) |
 
 #### Response Body — `200 OK`
 
 | Field | Type | Description |
 |---|---|---|
-| `messages` | `array` | List of message objects, newest first |
+| `messages` | `array` | Newest first |
 | `messages[].role` | `string` | `"user"` or `"assistant"` |
 | `messages[].message` | `string` | Message content |
-| `messages[].timestamp` | `string` | ISO datetime string (UTC) |
-
-#### Example Request
-
-```
-GET /chat/history?user_id=user_2abc123def456&limit=50
-```
-
-#### Example Response
-
-```json
-{
-  "messages": [
-    {
-      "role": "assistant",
-      "message": "Good session yesterday. Take it easy today.",
-      "timestamp": "2026-03-21T10:34:22.123456+00:00"
-    },
-    {
-      "role": "user",
-      "message": "How did my training go this week?",
-      "timestamp": "2026-03-21T10:34:18.000000+00:00"
-    }
-  ]
-}
-```
+| `messages[].timestamp` | `string` | ISO datetime (UTC) |
 
 ---
 
 ### `POST /training-plan/generate`
 
-Generates a complete multi-week training block for the user. Normally triggered automatically when onboarding completes — use this endpoint to regenerate a plan on demand.
+Generates a complete multi-week training block. Normally triggered automatically when onboarding completes. Use this to regenerate on demand.
 
 **Plan length by goal:**
+
 | Goal | Weeks |
 |---|---|
 | First 5K | 8 |
@@ -348,253 +433,149 @@ Generates a complete multi-week training block for the user. Normally triggered 
 | First marathon | 18 |
 | Just run consistently | 8 |
 
-If the user has a target race date, the plan runs from next Monday to race day, capped at the goal's default. Plan always starts on a Monday.
-
-On each request the backend:
-
-1. Fetches the user's profile (goal, target race date, training days) from DynamoDB
-2. Fetches Garmin credentials, decrypts via KMS, and authenticates with Garmin Connect
-3. Runs the Strands agent (Claude Haiku 4.5) which checks recent Garmin data, then generates the full block structured as: base phase → build phase → peak phase → taper
-4. Saves one DynamoDB item per day (`SK: PLAN#YYYY-MM-DD`)
-5. Returns all weeks
+If the user has a target race date, the plan runs from next Monday to race day, capped at the goal default. Always starts on a Monday.
 
 #### Request Body
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 
 #### Response Body — `200 OK`
 
-Same shape as `GET /training-plan` — all weeks grouped and sorted chronologically.
-
 | Field | Type | Description |
 |---|---|---|
-| `weeks` | `array` | All generated `PlanWeek` objects sorted by `week_start` ascending |
-| `weeks[].week_start` | `string` | ISO date of the Monday this week starts on |
-| `weeks[].days` | `array` | Array of 7 `PlanDay` objects |
+| `weeks` | `array` | All `PlanWeek` objects sorted by `week_start` ascending |
+| `weeks[].week_start` | `string` | ISO date of the Monday this week starts |
+| `weeks[].days` | `array` | 7 `PlanDay` objects |
 
 **`PlanDay` object:**
 
 | Field | Type | Description |
 |---|---|---|
-| `date` | `string` | ISO date of this day (`YYYY-MM-DD`) |
-| `week_start` | `string` | ISO date of the Monday this day belongs to |
-| `type` | `string` | Workout type: `intervals`, `tempo`, `threshold`, `fartlek`, `easy`, `long`, or `rest` |
-| `distance` | `number` | Distance in kilometres (`0` for rest days) |
+| `date` | `string` | `YYYY-MM-DD` |
+| `week_start` | `string` | `YYYY-MM-DD` (Monday) |
+| `type` | `string` | `intervals`, `tempo`, `threshold`, `fartlek`, `easy`, `long`, or `rest` |
+| `distance` | `number` | Kilometres (`0` for rest) |
 | `description` | `string` | Specific workout description |
 
 #### Error Responses
 
 | Status | Detail | Cause |
 |---|---|---|
-| `404` | `"User profile not found. Please complete onboarding first."` | No profile found for this `user_id` |
-| `404` | `"User credentials not found. Please complete onboarding first."` | No Garmin credentials found for this `user_id` |
-| `503` | `"Unable to retrieve Garmin credentials. Please try again."` | KMS decryption failed |
-| `503` | `"Unable to connect to Garmin. Please check your credentials and try again."` | Garmin Connect authentication failed |
-| `500` | `"Failed to generate training plan. Please try again."` | Agent error or invalid JSON returned |
+| `404` | `"User profile not found..."` | No profile |
+| `404` | `"User credentials not found..."` | No credentials (Garmin only) |
+| `503` | `"Unable to retrieve Garmin credentials..."` | KMS failure (Garmin only) |
+| `503` | `"Unable to connect to Garmin..."` | Garmin auth failed (Garmin only) |
+| `500` | `"Failed to generate training plan..."` | Agent or JSON parse error |
 
-#### Example Request
-
-```json
-POST /training-plan/generate
-Content-Type: application/json
-
-{
-  "user_id": "user_2abc123def456"
-}
-```
-
-#### Example Response
-
-```json
-{
-  "weeks": [
-    {
-      "week_start": "2026-03-30",
-      "days": [
-        {
-          "date": "2026-03-30",
-          "week_start": "2026-03-30",
-          "type": "easy",
-          "distance": 6.0,
-          "description": "Easy aerobic run at conversational pace. Keep HR in zone 2."
-        },
-        {
-          "date": "2026-03-31",
-          "week_start": "2026-03-30",
-          "type": "rest",
-          "distance": 0,
-          "description": "Rest day — recovery, stretching, hydration."
-        }
-      ]
-    },
-    {
-      "week_start": "2026-04-06",
-      "days": [
-        {
-          "date": "2026-04-06",
-          "week_start": "2026-04-06",
-          "type": "easy",
-          "distance": 7.0,
-          "description": "Easy run building on last week's base."
-        }
-      ]
-    }
-  ]
-}
-```
+> **Note:** `POST /training-plan/generate` is Garmin-only. For Strava users, the plan is generated automatically in the background after onboarding completes via `POST /chat/stream`.
 
 ---
 
 ### `GET /training-plan`
 
-Returns all saved training plan days for the user, grouped by week. Weeks are sorted chronologically.
+Returns all saved training plan days for the user, grouped by week.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 
 #### Response Body — `200 OK`
 
-| Field | Type | Description |
-|---|---|---|
-| `weeks` | `array` | List of `PlanWeek` objects sorted by `week_start` ascending |
-| `weeks[].week_start` | `string` | ISO date of the Monday this week starts on |
-| `weeks[].days` | `array` | Array of `PlanDay` objects for that week (see schema above) |
-
-#### Example Request
-
-```
-GET /training-plan?user_id=user_2abc123def456
-```
-
-#### Example Response
-
-```json
-{
-  "weeks": [
-    {
-      "week_start": "2026-03-30",
-      "days": [
-        {
-          "date": "2026-03-30",
-          "week_start": "2026-03-30",
-          "type": "easy",
-          "distance": 8.0,
-          "description": "Easy aerobic run at conversational pace. Keep HR in zone 2."
-        }
-      ]
-    }
-  ]
-}
-```
+Same shape as `POST /training-plan/generate` — `{ weeks: PlanWeek[] }`.
 
 ---
 
 ### `DELETE /conversation`
 
-Deletes all chat history for a user. Profile and Garmin credentials are preserved — the user does not need to re-onboard.
+Deletes all chat history for a user. Profile and credentials are preserved.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 
 #### Response Body — `200 OK`
 
-| Field | Type | Description |
-|---|---|---|
-| `success` | `boolean` | `true` if conversation was cleared |
-| `message` | `string` | Human-readable confirmation |
-
-#### Example Request
-
-```
-DELETE /conversation?user_id=user_2abc123def456
-```
-
-#### Example Response
-
 ```json
-{
-  "success": true,
-  "message": "Conversation cleared."
-}
+{ "success": true, "message": "Conversation cleared." }
 ```
 
 ---
 
 ### `DELETE /user`
 
-Deletes all data for a user from DynamoDB — profile, Garmin credentials, chat history, and training plan. The user will need to complete onboarding again after this.
+Deletes all DynamoDB data for a user — profile, Garmin credentials, Strava credentials, Garmin session cache, chat history, training plan, and cached activities. The user will need to complete onboarding again.
 
-> **Note:** This does not delete the Clerk account. Handle Clerk account deletion on the frontend using Clerk's `deleteUser()` method.
+> **Note:** Does not delete the Clerk account. Handle that on the frontend with `deleteUser()`.
 
 #### Query Parameters
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `user_id` | `string` | Yes | Clerk userId of the authenticated user |
+| `user_id` | `string` | Yes | Clerk userId |
 
 #### Response Body — `200 OK`
 
-| Field | Type | Description |
-|---|---|---|
-| `success` | `boolean` | `true` if user data was deleted |
-| `message` | `string` | Human-readable confirmation |
-
-#### Example Request
-
-```
-DELETE /user?user_id=user_2abc123def456
-```
-
-#### Example Response
-
 ```json
-{
-  "success": true,
-  "message": "User data deleted. Please complete onboarding again."
-}
+{ "success": true, "message": "User data deleted. Please complete onboarding again." }
 ```
 
-> **Frontend:** After this completes, call `GET /user/status` — it will return `"not_found"`. Clear all local state (chat history, plan data, onboarding status) and redirect to the Connect Garmin screen.
+> **Frontend:** After this, call `GET /user/status` — it returns `"not_found"`. Clear all local state and redirect to the connect screen.
 
 ---
 
 ### `GET /health`
 
-Health check endpoint.
+Health check.
 
-#### Response Body — `200 OK`
-
-| Field | Type | Description |
-|---|---|---|
-| `status` | `string` | Always `"ok"` when the service is running |
-
-#### Example Request
-
-```
-GET /health
-```
-
-#### Example Response
+#### Response — `200 OK`
 
 ```json
-{
-  "status": "ok"
-}
+{ "status": "ok" }
 ```
 
 ---
 
-## Error Response Format
+## DynamoDB Schema
 
-All error responses follow FastAPI's default format:
+Single-table design. Partition key: `PK = USER#<userId>`. Sort key: `SK`.
+
+| SK | Contents |
+|---|---|
+| `PROFILE` | `onboardingStatus`, `dataSource`, `name`, `goal`, `targetRaceDate`, `daysPerWeek`, `createdAt` |
+| `CREDENTIALS` | `garminEmail`, `garminPasswordEncrypted` (KMS), `kmsKeyId` |
+| `GARMIN_SESSION` | `sessionData` — JSON string `{jwt_web, csrf_token, cookies}`. JWT expires every ~2 hours; backend auto re-logins on expiry using stored credentials. |
+| `STRAVA_CREDENTIALS` | `athleteId`, `accessToken`, `refreshToken`, `expiresAt` |
+| `CHAT#<timestamp>` | `role`, `message`, `conversationId` |
+| `PLAN#<date>` | `weekStart`, `type`, `distance`, `description` |
+| `ACTIVITY#<date>#<id>` | `date`, `type`, `distance_km`, `avg_pace_per_km`, `avg_hr`, etc. |
+| `SYNC#<YYYY-MM>` | Presence marker — written once per month when Strava activities are first fetched. Prevents redundant Strava API calls on subsequent calendar views. |
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `MODEL_ID` | No | Bedrock model ID (default `au.anthropic.claude-haiku-4-5-20251001-v1:0`) |
+| `AWS_REGION` | No | AWS region (default `ap-southeast-2`) |
+| `DYNAMODB_TABLE` | No | DynamoDB table name (default `ai-running-coach`) |
+| `KMS_KEY_ID` | **Yes** (Garmin) | KMS key for encrypting Garmin passwords |
+| `STRAVA_CLIENT_ID` | **Yes** (Strava) | Strava API app client ID |
+| `STRAVA_CLIENT_SECRET` | **Yes** (Strava) | Strava API app client secret |
+| `FRONTEND_URL` | **Yes** (Strava) | Base URL for Strava OAuth redirect (e.g. `https://yourapp.com`) |
+| `GARMIN_EMAIL` | Dev only | Garmin account email — used by `seed_garmin_session.py` to seed an initial session |
+| `GARMIN_PASSWORD` | Dev only | Garmin account password — used by `seed_garmin_session.py` |
+| `GARMIN_USER_ID` | Dev only | Clerk userId to associate the seeded session with — used by `seed_garmin_session.py` |
+
+---
+
+## Error Response Format
 
 ```json
 {
@@ -606,13 +587,10 @@ All error responses follow FastAPI's default format:
 
 ## Local Development
 
-Start the server:
-
 ```bash
 set -a && source .env && set +a
 uvicorn main:app --reload
 ```
 
-Interactive API docs (Swagger UI): [http://localhost:8000/docs](http://localhost:8000/docs)
-
-Alternative docs (ReDoc): [http://localhost:8000/redoc](http://localhost:8000/redoc)
+Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+ReDoc: [http://localhost:8000/redoc](http://localhost:8000/redoc)

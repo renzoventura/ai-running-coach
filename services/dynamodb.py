@@ -18,13 +18,18 @@ def _get_table():
     return dynamodb.Table(_TABLE_NAME)
 
 
-def create_profile(user_id: str, onboarding_status: str = "garmin_connected") -> bool:
+def create_profile(
+    user_id: str,
+    onboarding_status: str = "garmin_connected",
+    data_source: str = "garmin",
+) -> bool:
     """
     Create an initial user profile with the given onboarding status.
 
     Args:
         user_id: The unique identifier for the user.
-        onboarding_status: Initial status — "garmin_connected" after Garmin is linked.
+        onboarding_status: Initial status — "garmin_connected" after data source is linked.
+        data_source: "garmin" or "strava" — determines which tools the coaching agent uses.
 
     Returns:
         True if saved successfully, False otherwise.
@@ -36,10 +41,11 @@ def create_profile(user_id: str, onboarding_status: str = "garmin_connected") ->
                 "PK": f"USER#{user_id}",
                 "SK": "PROFILE",
                 "onboardingStatus": onboarding_status,
+                "dataSource": data_source,
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
         )
-        logger.info("Created profile for user %s (status=%s)", user_id, onboarding_status)
+        logger.info("Created profile for user %s (status=%s, source=%s)", user_id, onboarding_status, data_source)
         return True
     except Exception as e:
         logger.error("Failed to create profile for user %s: %s", user_id, e)
@@ -354,6 +360,38 @@ def clear_chat_history(user_id: str) -> bool:
         return False
 
 
+def is_month_synced(user_id: str, year_month: str) -> bool:
+    """
+    Return True if activities for this month have already been fetched and cached.
+
+    Args:
+        user_id: Clerk userId.
+        year_month: Month in YYYY-MM format.
+    """
+    try:
+        table = _get_table()
+        result = table.get_item(Key={"PK": f"USER#{user_id}", "SK": f"SYNC#{year_month}"})
+        return "Item" in result
+    except Exception as e:
+        logger.warning("Failed to check sync marker for %s %s: %s", user_id, year_month, e)
+        return False
+
+
+def mark_month_synced(user_id: str, year_month: str) -> None:
+    """
+    Record that activities for this month have been fetched and cached.
+
+    Args:
+        user_id: Clerk userId.
+        year_month: Month in YYYY-MM format.
+    """
+    try:
+        table = _get_table()
+        table.put_item(Item={"PK": f"USER#{user_id}", "SK": f"SYNC#{year_month}"})
+    except Exception as e:
+        logger.warning("Failed to set sync marker for %s %s: %s", user_id, year_month, e)
+
+
 def delete_user_data(user_id: str) -> bool:
     """
     Delete all DynamoDB data for a user — profile, credentials, chat history, and training plan.
@@ -364,9 +402,11 @@ def delete_user_data(user_id: str) -> bool:
         _delete_item(user_id, "PROFILE")
         _delete_item(user_id, "CREDENTIALS")
         _delete_item(user_id, "GARMIN_SESSION")
+        _delete_item(user_id, "STRAVA_CREDENTIALS")
         chat_count = _delete_items_with_prefix(user_id, "CHAT#")
         plan_count = _delete_items_with_prefix(user_id, "PLAN#")
         activity_count = _delete_items_with_prefix(user_id, "ACTIVITY#")
+        _delete_items_with_prefix(user_id, "SYNC#")
         logger.info(
             "Deleted all data for user %s — %d chat messages, %d plan days, %d activities",
             user_id, chat_count, plan_count, activity_count,
@@ -515,6 +555,74 @@ def get_cached_activities(user_id: str, since_date: str | None = None) -> list[d
     except Exception as e:
         logger.error("Failed to retrieve cached activities for user %s: %s", user_id, e)
         return []
+
+
+def save_strava_credentials(
+    user_id: str,
+    athlete_id: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: int,
+) -> bool:
+    """
+    Store Strava OAuth credentials for a user in DynamoDB.
+
+    Args:
+        user_id: The unique identifier for the user.
+        athlete_id: The Strava athlete ID.
+        access_token: Short-lived Strava access token (valid ~6 hours).
+        refresh_token: Long-lived token used to get new access tokens.
+        expires_at: Unix timestamp when access_token expires.
+
+    Returns:
+        True if saved successfully, False otherwise.
+    """
+    try:
+        table = _get_table()
+        table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "STRAVA_CREDENTIALS",
+                "athleteId": athlete_id,
+                "accessToken": access_token,
+                "refreshToken": refresh_token,
+                "expiresAt": expires_at,
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        logger.info("Saved Strava credentials for user %s", user_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to save Strava credentials for user %s: %s", user_id, e)
+        return False
+
+
+def get_strava_credentials(user_id: str) -> Optional[dict]:
+    """
+    Retrieve stored Strava credentials for a user from DynamoDB.
+
+    Args:
+        user_id: The unique identifier for the user.
+
+    Returns:
+        Dict with athlete_id, access_token, refresh_token, expires_at, or None if not found.
+    """
+    try:
+        table = _get_table()
+        response = table.get_item(Key={"PK": f"USER#{user_id}", "SK": "STRAVA_CREDENTIALS"})
+        item = response.get("Item")
+        if not item:
+            logger.info("No Strava credentials found for user %s", user_id)
+            return None
+        return {
+            "athlete_id": item["athleteId"],
+            "access_token": item["accessToken"],
+            "refresh_token": item["refreshToken"],
+            "expires_at": int(item["expiresAt"]),
+        }
+    except Exception as e:
+        logger.error("Failed to retrieve Strava credentials for user %s: %s", user_id, e)
+        return None
 
 
 def get_chat_history(user_id: str, limit: int = 20) -> list[dict]:

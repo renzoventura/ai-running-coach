@@ -65,6 +65,16 @@ class GetPlanResponse(BaseModel):
 
 class UserStatusResponse(BaseModel):
     onboarding_status: str  # "not_found" | "garmin_connected" | "complete"
+    data_source: str = "garmin"  # "garmin" | "strava"
+
+
+class StravaRefreshRequest(BaseModel):
+    user_id: str
+
+
+class StravaRefreshResponse(BaseModel):
+    refreshed: bool
+    message: str
 
 
 class ActivitySummary(BaseModel):
@@ -77,3 +87,9 @@ class ActivitySummary(BaseModel):
 
 class ActivitiesResponse(BaseModel):
     activities: list[ActivitySummary]
+
+
+class ActivitySyncRequest(BaseModel):
+    user_id: str
+    since: str  # YYYY-MM-DD
+    until: str  # YYYY-MM-DD

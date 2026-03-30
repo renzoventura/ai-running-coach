@@ -11,3 +11,4 @@ build/
 *.egg-info/
 .aws-sam/
 samconfig.toml
+garmin_debug_dump.json

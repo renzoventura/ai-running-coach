@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from strands import Agent
 from strands.models import BedrockModel
 
-from agent.tools import make_onboarding_tools, make_tools
+from agent.tools import make_onboarding_tools, make_strava_tools, make_tools
 from services.garmin import GarminClient
 
 logger = logging.getLogger(__name__)
@@ -235,6 +235,46 @@ async def stream_agent(
 
 
 
+async def stream_strava_agent(
+    message: str,
+    user_id: str,
+    access_token: str,
+    athlete_id: str,
+    chat_history: list[dict] | None = None,
+    timezone: str = "Australia/Melbourne",
+):
+    """
+    Async generator that streams the coaching agent response for a Strava user.
+
+    Uses Strava tools instead of Garmin tools. The system prompt includes a
+    note that sleep and resting HR are unavailable via Strava.
+    """
+    from services.strava import StravaClient
+
+    model = _build_model()
+    system = COACHING_PROMPT + (
+        "\n\nNote: This athlete connects via Strava, not Garmin. "
+        "Sleep data and resting heart rate are not available — Strava does not provide these metrics. "
+        "If asked about sleep or HR trends, acknowledge the limitation clearly and coach based on "
+        "activity data and training volume instead."
+    )
+    agent = Agent(
+        model=model,
+        system_prompt=system,
+        tools=make_strava_tools(StravaClient(), access_token, athlete_id, timezone, user_id),
+    )
+    prompt = _build_prompt(message, chat_history, timezone)
+    logger.info("Streaming Strava agent for user %s", user_id)
+
+    async for event in agent.stream_async(prompt):
+        if "data" in event and isinstance(event["data"], str):
+            yield event["data"]
+        elif "contentBlockDelta" in event:
+            chunk = event["contentBlockDelta"].get("delta", {}).get("text", "")
+            if chunk:
+                yield chunk
+
+
 PLAN_SYSTEM_PROMPT = """You are an expert running coach generating a complete multi-week training block.
 
 You have access to tools to retrieve the user's Garmin data (recent activities, sleep, training load, heart rate).
@@ -297,27 +337,10 @@ def _plan_weeks(goal: str, race_date_str: str | None) -> int:
         return default
 
 
-def generate_plan(
-    user_id: str,
-    garmin_client: GarminClient,
-    user_profile: dict,
-) -> list[dict]:
+def _run_plan_agent(user_id: str, user_profile: dict, tools: list) -> list[dict]:
     """
-    Generate a complete multi-week training block using the Strands agent.
-
-    Calculates the plan length from the user's goal and race date, then asks the
-    agent to produce a flat JSON array of one object per day for the full block.
-
-    Args:
-        user_id: The unique identifier for the user.
-        garmin_client: An authenticated GarminClient instance.
-        user_profile: Profile dict with goal, targetRaceDate, daysPerWeek, name.
-
-    Returns:
-        List of plan day dicts (n_weeks × 7 items) parsed from the agent's JSON.
-
-    Raises:
-        ValueError: If the agent response cannot be parsed as valid plan JSON.
+    Core plan generation logic shared by Garmin and Strava variants.
+    Builds the prompt, runs the agent, parses and validates the JSON response.
     """
     goal = user_profile.get("goal", "Just run consistently")
     race_date_str = user_profile.get("targetRaceDate")
@@ -326,16 +349,8 @@ def generate_plan(
     plan_end = plan_start + timedelta(weeks=n_weeks) - timedelta(days=1)
     total_days = n_weeks * 7
 
-    model = BedrockModel(
-        model_id=os.environ.get("MODEL_ID", "au.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        region_name=os.environ.get("AWS_REGION", "ap-southeast-2"),
-    )
-
-    agent = Agent(
-        model=model,
-        system_prompt=PLAN_SYSTEM_PROMPT,
-        tools=make_tools(garmin_client, user_id=user_id),
-    )
+    model = _build_model()
+    agent = Agent(model=model, system_prompt=PLAN_SYSTEM_PROMPT, tools=tools)
 
     prompt = (
         f"Generate a complete {n_weeks}-week training block ({total_days} days total).\n\n"
@@ -351,10 +366,7 @@ def generate_plan(
         f"Then respond with ONLY the raw JSON array of {total_days} objects — no markdown, no explanation."
     )
 
-    logger.info(
-        "Generating %d-week plan for user %s (%s, %d days)",
-        n_weeks, user_id, goal, total_days,
-    )
+    logger.info("Generating %d-week plan for user %s (%s, %d days)", n_weeks, user_id, goal, total_days)
     result = agent(prompt)
     raw = re.sub(r"<thinking>.*?</thinking>\n?", "", str(result), flags=re.DOTALL).strip()
 
@@ -373,3 +385,24 @@ def generate_plan(
         )
 
     return days
+
+
+def generate_plan(
+    user_id: str,
+    garmin_client: GarminClient,
+    user_profile: dict,
+) -> list[dict]:
+    """Generate a training block using Garmin data to calibrate starting mileage."""
+    return _run_plan_agent(user_id, user_profile, make_tools(garmin_client, user_id=user_id))
+
+
+def generate_plan_strava(
+    user_id: str,
+    access_token: str,
+    athlete_id: str,
+    user_profile: dict,
+) -> list[dict]:
+    """Generate a training block using Strava data to calibrate starting mileage."""
+    from services.strava import StravaClient
+    tools = make_strava_tools(StravaClient(), access_token, athlete_id, user_id=user_id)
+    return _run_plan_agent(user_id, user_profile, tools)

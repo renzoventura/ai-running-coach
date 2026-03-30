@@ -404,3 +404,103 @@ def make_onboarding_tools(user_id: str) -> list:
         return "Onboarding complete. Training plan will be generated."
 
     return [save_profile, complete_onboarding]
+
+
+def make_strava_tools(
+    strava_client,
+    access_token: str,
+    athlete_id: str,
+    timezone: str = "Australia/Melbourne",
+    user_id: str | None = None,
+) -> list:
+    """
+    Create Strands-compatible tool functions for a Strava-connected user.
+
+    Strava does not provide sleep or resting heart rate data — those tools
+    return a descriptive note so the agent can acknowledge the gap clearly.
+
+    Args:
+        strava_client: An authenticated StravaClient instance.
+        access_token: Valid Strava access token.
+        athlete_id: Strava athlete ID (for stats endpoint).
+        timezone: IANA timezone string. Used for cache cutoff dates.
+        user_id: Clerk userId — used as DynamoDB cache key.
+
+    Returns:
+        List of four tool functions ready to pass to a Strands Agent.
+    """
+    @tool
+    def get_recent_activities() -> list[dict[str, Any]]:
+        """
+        Retrieve the athlete's running activities from the last 28 days.
+
+        Use this tool when the user asks about recent runs, training history,
+        pace, distance, workout performance, or splits. Returns a list of
+        trimmed activity records including date, type, distance, pace, heart
+        rate, and per-km splits.
+        """
+        try:
+            from datetime import date, timedelta
+            from services.dynamodb import get_cached_activities, save_activities
+
+            today = date.today()
+            cache_cutoff = (today - timedelta(days=28)).isoformat()
+            fresh_cutoff = (today - timedelta(days=14)).isoformat()
+
+            fresh = strava_client.get_recent_activities(access_token, days=14)
+
+            if user_id and fresh:
+                save_activities(user_id, fresh)
+
+            all_cached = get_cached_activities(user_id, since_date=cache_cutoff) if user_id else []
+            cached = [a for a in all_cached if (a.get("date") or "") < fresh_cutoff]
+
+            combined = cached + fresh
+            combined.sort(key=lambda a: a.get("date") or "")
+            logger.info(
+                "get_recent_activities (Strava): %d from cache, %d fresh, %d total",
+                len(cached), len(fresh), len(combined),
+            )
+            return combined
+        except Exception as e:
+            logger.error("Failed to get Strava activities: %s", e)
+            return []
+
+    @tool
+    def get_sleep_data() -> list[dict[str, Any]]:
+        """
+        Sleep data is not available for Strava users.
+
+        Strava does not provide sleep tracking. If the user asks about sleep,
+        acknowledge this limitation and offer coaching advice based on activity
+        data alone.
+        """
+        return [{"note": "Sleep data is not available via Strava. Strava does not provide sleep tracking."}]
+
+    @tool
+    def get_training_load() -> dict[str, Any]:
+        """
+        Retrieve recent and year-to-date training volume from Strava athlete stats.
+
+        Use this tool when the user asks about training load, weekly volume,
+        total mileage, or overall training history. Returns recent (4-week)
+        and year-to-date run totals including count, distance, and time.
+        """
+        try:
+            return strava_client.get_athlete_stats(access_token, athlete_id)
+        except Exception as e:
+            logger.error("Failed to get Strava athlete stats: %s", e)
+            return {}
+
+    @tool
+    def get_heart_rate() -> list[dict[str, Any]]:
+        """
+        Resting heart rate data is not available for Strava users.
+
+        Strava does not expose resting HR or HRV data. If the user asks about
+        heart rate trends or recovery, acknowledge this limitation and coach
+        based on pace and perceived effort from activity data instead.
+        """
+        return [{"note": "Resting heart rate data is not available via Strava. Strava does not expose this metric."}]
+
+    return [get_recent_activities, get_sleep_data, get_training_load, get_heart_rate]

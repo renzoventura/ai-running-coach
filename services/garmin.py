@@ -23,16 +23,55 @@ class GarminClient:
         """Return True if connect() has been successfully called."""
         return self._client is not None
 
+    # Browser headers required for Garmin's /gc-api/ endpoint to return data.
+    # Without sec-ch-ua and related headers, the API returns 403.
+    _BROWSER_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Google Chrome";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-dest": "empty",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
     def _try_restore(self, email: str, session_data: str) -> bool:
         """
-        Attempt to restore a garth session from serialised token data.
+        Attempt to restore a session from serialised token data.
 
-        Garth will auto-refresh the access token using the refresh token if needed.
+        Checks the JWT_WEB expiry before restoring — if expired, returns False
+        so connect() falls through to a full re-login rather than silently
+        returning empty data from failed API calls.
+
+        After restoring, patches the library's internal requests session with
+        browser-like headers — required for Garmin's /gc-api/ endpoint to
+        return data instead of 403.
+
         Returns True if session was restored, False if the data is invalid/expired.
         """
+        import base64
+        import json as _json
+        import time
+        try:
+            data = _json.loads(session_data)
+            jwt_web = data.get("jwt_web", "")
+            # Decode JWT expiry without verifying signature
+            parts = jwt_web.split(".")
+            if len(parts) == 3:
+                payload = parts[1] + "=="  # pad base64
+                claims = _json.loads(base64.urlsafe_b64decode(payload))
+                exp = claims.get("exp", 0)
+                if exp and time.time() > exp:
+                    logger.info("Garmin JWT_WEB expired — forcing re-login")
+                    return False
+        except Exception:
+            pass  # If we can't decode, attempt restore anyway
+
         try:
             client = garminconnect.Garmin(email, "")
-            client.garth.loads(session_data)
+            client.client.loads(session_data)
+            client.client.cs.headers.update(self._BROWSER_HEADERS)
             self._client = client
             logger.info("Garmin session restored from cache")
             return True
@@ -55,6 +94,7 @@ class GarminClient:
             try:
                 client = garminconnect.Garmin(email, password)
                 client.login()
+                client.client.cs.headers.update(self._BROWSER_HEADERS)
                 self._client = client
                 logger.info("Garmin full login successful (attempt %d)", attempt + 1)
                 return True
@@ -84,7 +124,7 @@ class GarminClient:
         if not self._client or not user_id:
             return
         try:
-            session_data = self._client.garth.dumps()
+            session_data = self._client.client.dumps()
             _session_cache[user_id] = session_data
             from services.dynamodb import save_garmin_session
             save_garmin_session(user_id, session_data)
@@ -133,7 +173,7 @@ class GarminClient:
         # Save fresh session to both caches
         if user_id and self._client:
             try:
-                session_data = self._client.garth.dumps()
+                session_data = self._client.client.dumps()
                 _session_cache[user_id] = session_data
                 from services.dynamodb import save_garmin_session
                 save_garmin_session(user_id, session_data)

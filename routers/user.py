@@ -25,9 +25,10 @@ def get_user_status(user_id: str) -> UserStatusResponse:
     """
     profile = get_user_profile(user_id)
     if not profile:
-        return UserStatusResponse(onboarding_status="not_found")
+        return UserStatusResponse(onboarding_status="not_found", data_source="garmin")
     status = profile.get("onboardingStatus", "garmin_connected")
-    return UserStatusResponse(onboarding_status=status)
+    data_source = profile.get("dataSource", "garmin")
+    return UserStatusResponse(onboarding_status=status, data_source=data_source)
 
 
 @router.delete("/conversation", response_model=DeleteResponse)
