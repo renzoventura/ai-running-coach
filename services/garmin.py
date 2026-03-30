@@ -72,11 +72,15 @@ class GarminClient:
             client = garminconnect.Garmin(email, "")
             client.client.loads(session_data)
             client.client.cs.headers.update(self._BROWSER_HEADERS)
+            # Validate the session and populate display_name (needed for HR/sleep endpoints).
+            # If this raises (e.g. 401), the session is dead — fall through to full login.
+            profile = client.get_user_profile()
+            client.display_name = profile.get("displayName") if profile else None
             self._client = client
-            logger.info("Garmin session restored from cache")
+            logger.info("Garmin session restored from cache (display_name=%s)", client.display_name)
             return True
         except Exception as e:
-            logger.warning("Failed to restore Garmin session from cache: %s", e)
+            logger.warning("Garmin session restore failed (will re-login): %s", e)
             return False
 
     def _full_login(self, email: str, password: str) -> bool:
